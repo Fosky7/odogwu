@@ -1,2 +1,5 @@
-# odogwu
-Exported from KrossBuild
+# Odogwu
+
+A project built with KrossBuild
+
+Built with ❤️ using KrossBuild
