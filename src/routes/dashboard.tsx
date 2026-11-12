@@ -7,6 +7,7 @@ import { PledgeList } from "@/components/PledgeList";
 import { AUTH_CHANGE_EVENT } from "@/lib/authStore";
 import { subscribeToBillRequests } from "@/services/causes";
 import { getDashboardSnapshot, type DashboardData } from "@/services/users";
+import { subscribeToMyPledges } from "@/services/myPledges";
 
 export const Route = createFileRoute("/dashboard")({
   head: () => ({
@@ -59,12 +60,14 @@ function DashboardPage() {
     // hydrates (server readback and legacy adoption), so re-read the snapshot
     // whenever it publishes a new value.
     const unsubscribeRequests = subscribeToBillRequests(sync);
+    const unsubscribePledges = subscribeToMyPledges(sync);
 
     return () => {
       window.removeEventListener("storage", sync);
       window.removeEventListener("focus", sync);
       window.removeEventListener(AUTH_CHANGE_EVENT, sync);
       unsubscribeRequests();
+      unsubscribePledges();
     };
   }, []);
 

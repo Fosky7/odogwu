@@ -45,6 +45,8 @@ export type DashboardData = {
   requests: DashboardRequest[];
 };
 
+import { getMyPledgesSnapshot, isSignedInToBackend } from '@/services/myPledges';
+
 export const DEFAULT_CAUSE_TITLE = 'Pledge to a verified cause';
 
 export function formatNaira(value: number): string {
@@ -240,8 +242,9 @@ function createFallbackDashboard(account: CurrentAccount | null): DashboardData 
     email: account?.email ?? null,
     fullName: account?.fullName?.trim() ? account.fullName.trim() : null,
     phone: account?.phone?.trim() ? account.phone.trim() : null,
-    pledges: SAMPLE_DASHBOARD_PLEDGES.map((pledge) => ({ ...pledge })),
-    requests: SAMPLE_DASHBOARD_REQUESTS.map((request) => ({ ...request })),
+    // Signed-in people never see made-up examples; only visitors do.
+    pledges: account ? [] : SAMPLE_DASHBOARD_PLEDGES.map((pledge) => ({ ...pledge })),
+    requests: account ? [] : SAMPLE_DASHBOARD_REQUESTS.map((request) => ({ ...request })),
   };
 }
 
@@ -261,16 +264,29 @@ export function getDashboardSnapshot(): DashboardData {
 
   try {
     const collected = collectDashboardRecords();
-    const pledges = dedupeRecords(collected.pledges).map(normalizePledge);
+    const signedIn = Boolean(account) || isSignedInToBackend();
+    const saved: DashboardPledge[] = getMyPledgesSnapshot().map((p) => ({
+      id: p.id,
+      reference: p.reference,
+      causeId: p.causeId,
+      causeTitle: p.causeTitle || DEFAULT_CAUSE_TITLE,
+      amountNaira: p.amountNaira,
+      amountLabel: formatNaira(p.amountNaira),
+      createdAt: p.createdAt,
+    }));
+    const savedRefs = new Set(saved.map((p) => p.reference));
+    const local = dedupeRecords(collected.pledges).map(normalizePledge).filter((p) => !savedRefs.has(p.reference));
+    const pledges = [...saved, ...local];
     const requests = getBillRequestsSnapshot().map(requestRecordToDashboard);
+    const samples = !signedIn;
 
     return {
       signedIn: Boolean(account),
       email: account?.email ?? null,
       fullName: account?.fullName?.trim() ? account.fullName.trim() : null,
       phone: account?.phone?.trim() ? account.phone.trim() : null,
-      pledges: pledges.length > 0 ? pledges : SAMPLE_DASHBOARD_PLEDGES.map((pledge) => ({ ...pledge })),
-      requests: requests.length > 0 ? requests : SAMPLE_DASHBOARD_REQUESTS.map((request) => ({ ...request })),
+      pledges: pledges.length > 0 || !samples ? pledges : SAMPLE_DASHBOARD_PLEDGES.map((pledge) => ({ ...pledge })),
+      requests: requests.length > 0 || !samples ? requests : SAMPLE_DASHBOARD_REQUESTS.map((request) => ({ ...request })),
     };
   } catch {
     return createFallbackDashboard(account);

@@ -14,6 +14,7 @@ import {
 } from "@/lib/payments";
 import { getCurrentUser } from "@/services/auth";
 import { getCause } from "@/services/causes";
+import { saveMyPledge } from "@/services/myPledges";
 import {
   addPledge,
   getCauseFundingSummary,
@@ -111,6 +112,11 @@ function settlePledge({ causeId, amountMinor }: { causeId: string; amountMinor: 
   });
 
   const settledReference = created?.reference ?? reference;
+
+  // Keep a copy against the signed-in account so "My pledges" follows them.
+  let causeTitle = "";
+  try { causeTitle = getCause(causeId)?.title ?? ""; } catch { /* unknown bill */ }
+  void saveMyPledge({ causeId, causeTitle, amountNaira: fromMinorUnits(amountMinor), reference: settledReference }).catch(() => {});
 
   // Prefer the receipt minted for this exact reference; fall back to the newest
   // receipt on the bill so the donor can still open their proof of payment.
