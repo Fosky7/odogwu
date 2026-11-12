@@ -267,6 +267,9 @@ jobs:
             try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
             for (const e of ents) {
               if (e.name === 'node_modules' || e.name === '.git' || e.name === 'dist') continue;
+              // Test-only files are never bundled; their imports (e.g. @playwright/test) must not fail the build.
+              if (e.isDirectory() && ['verification', '__tests__', 'e2e', 'tests'].includes(e.name)) continue;
+              if (/\.(spec|test)\.[cm]?[jt]sx?$/.test(e.name)) continue;
               const fp = path.join(d, e.name);
               if (e.isDirectory()) walk(fp);
               else if (exts.has(path.extname(e.name))) files.push(fp);
