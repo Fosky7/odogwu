@@ -1,0 +1,29 @@
+{
+  "tables": [
+    {
+      "table": "bill_requests",
+      "ownerKey": "owner_id",
+      "sourceCollection": "bill_requests_v1",
+      "uniqueKey": ["owner_id", "source_collection", "source_id"],
+      "fixtures": {
+        "title": "E2E disposable bill request",
+        "amount_owed": 18500,
+        "description": "Disposable record written by the backend adoption verification run.",
+        "proof_file_name": "bill-proof.png",
+        "status": "pending",
+        "submitted_at": "2024-05-01T10:00:00.000Z"
+      }
+    },
+    {
+      "table": "backend_keys",
+      "ownerKey": "owner_id",
+      "sourceCollection": "backend_key_",
+      "uniqueKey": ["owner_id", "source_collection", "source_id"],
+      "fixtures": {
+        "key_value": "sb_publishable_disposable",
+        "fetched_at": "2024-05-01T10:00:00.000Z"
+      }
+    }
+  ],
+  "notes": "`_odogwu_storage_probe_` / `__odogwu_storage_probe__` is a storage availability probe written and immediately removed by the app; it holds no user data and therefore has no table. Fixtures are disposable test data only."
+}
