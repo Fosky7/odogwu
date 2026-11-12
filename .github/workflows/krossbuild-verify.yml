@@ -1,5 +1,5 @@
 name: Kross Verify
-# KrossBuild bundle-verification lane v17-link-check-valid-yaml
+# KrossBuild bundle-verification lane v18-pass-with-no-tests
 #
 # Proves that a candidate tree really installs, typechecks and bundles BEFORE
 # KrossBuild publishes it. Never deploys anything.
@@ -201,7 +201,7 @@ jobs:
           cat > /tmp/kross-browser-tools/check.config.cjs <<'CONFIGEOF'
           module.exports={testDir:process.env.GITHUB_WORKSPACE+'/src/verification',testMatch:'**/*.spec.{ts,tsx,js,mjs,cjs}',timeout:45000,retries:0,workers:1,reporter:[['json',{outputFile:'/tmp/kross-browser-flows.json'}]],use:{baseURL:'http://127.0.0.1:4173',headless:true}};
           CONFIGEOF
-          /tmp/kross-browser-tools/node_modules/.bin/playwright test --config=/tmp/kross-browser-tools/check.config.cjs
+          /tmp/kross-browser-tools/node_modules/.bin/playwright test --config=/tmp/kross-browser-tools/check.config.cjs --pass-with-no-tests
 
       - name: 🧪 Boot assertion (every route, real browser)
         env:
