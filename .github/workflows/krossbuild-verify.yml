@@ -1,5 +1,5 @@
 name: Kross Verify
-# KrossBuild bundle-verification lane v16-dead-link-check
+# KrossBuild bundle-verification lane v17-link-check-valid-yaml
 #
 # Proves that a candidate tree really installs, typechecks and bundles BEFORE
 # KrossBuild publishes it. Never deploys anything.
@@ -384,7 +384,7 @@ jobs:
           }
 
           /** Text that means the app showed its own "not found" screen. */
-          const NOT_FOUND_RE = /(not found|could ?n.t find|could not find|does ?n.t exist|does not exist|no longer exists|404)/i;
+          const NOT_FOUND_RE = /(not found|could ?n.t find|could not find|does ?n.t exist|does not exist|no longer exists|\b404\b)/i;
 
           /** Follow each distinct in-app link once; a link that lands on a not-found screen is dead. */
           async function checkLinks(browser, reports) {
