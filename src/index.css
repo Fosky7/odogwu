@@ -1,0 +1,242 @@
+/**
+ * Global stylesheet — Module 1, step 8 (polish empty, missing and mobile
+ * states, part 3 of 3).
+ *
+ * ADDITIVE ONLY. This file never re-declares the theme tokens, resets or
+ * Tailwind's entry directives (those live in `src/styles.css` and are imported
+ * alongside this file by `src/routes/__root.tsx`). Everything below is scoped to
+ * the markup this product actually renders — data-testids, the `#main-content`
+ * landmark, the shell's banner/contentinfo landmarks — so it cannot leak into
+ * unrelated parts of the app.
+ *
+ * What it fixes:
+ * 1. On a phone (390×844) the deck's "Pledge" and "Skip" actions stay above the
+ *    fold without the donor scrolling: shell padding, the intro copy and the
+ *    card's internal spacing are all tightened, and the beneficiary story is
+ *    clamped to two lines.
+ * 2. On short viewports (≤720px tall) the story clamps to one line and the
+ *    decorative deck counter (only in the `ready` state) is dropped, so the
+ *    actions still fit.
+ * 3. Empty / missing states ("You're all caught up", "No pledges yet", "We
+ *    couldn't find that bill") fill the width with full-width tap targets.
+ * 4. Long, unbroken words can never push the layout sideways, images never
+ *    overflow their card, and motion is reduced for users who ask for it.
+ * 5. The header brand lockup (logo + "Odogwu" name) keeps the exact desktop
+ *    measurement (104×28px) at phone width, so mobile tightening never resizes
+ *    the logo or the app name.
+ *
+ * No colors are declared here — every visual still comes from the design tokens
+ * used by the components.
+ */
+
+/* ------------------------------------------------------------------ */
+/* 1. Small-viewport measurements, kept in one place.                 */
+/* ------------------------------------------------------------------ */
+:root {
+  --app-mobile-gutter: 0.875rem;
+  --deck-card-padding: 1rem;
+  --deck-card-gap: 0.75rem;
+  --deck-tap-target: 2.5rem;
+}
+
+/* ------------------------------------------------------------------ */
+/* 2. Defensive overflow guards (layout only, no colors).             */
+/* ------------------------------------------------------------------ */
+img,
+svg,
+video,
+canvas {
+  max-width: 100%;
+}
+
+img {
+  height: auto;
+}
+
+[data-testid="bill-card"],
+[data-testid="empty-state"],
+[data-testid="error-boundary"],
+[data-testid="cause-amount"] {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* ------------------------------------------------------------------ */
+/* 3. Phones: keep the deck's actions above the fold.                 */
+/* ------------------------------------------------------------------ */
+@media (max-width: 640px) {
+  /* --- shell ------------------------------------------------------ */
+  #main-content {
+    padding: 0.875rem var(--app-mobile-gutter) 1rem;
+  }
+
+  header[role="banner"] > div {
+    gap: 0.375rem;
+    padding: 0.5rem var(--app-mobile-gutter);
+  }
+
+  /*
+   * The brand lockup must keep its desktop look on a phone: a 16px logo, an
+   * 18px bold name, a 0.5rem gap and the tight tracking — i.e. exactly
+   * 104×28px. Pinning the type and icon sizes here means the tighter mobile
+   * shell padding/gap can never leak into the brand and resize it.
+   */
+  header[role="banner"] a[aria-label="Odogwu home"] {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 1.125rem;
+    line-height: 1.75rem;
+  }
+
+  header[role="banner"] a[aria-label="Odogwu home"] > svg {
+    width: 1rem;
+    height: 1rem;
+    flex-shrink: 0;
+  }
+
+  header[role="banner"] a[aria-label="Odogwu home"] > span {
+    font-size: 1.125rem;
+    line-height: 1.75rem;
+    font-weight: 700;
+    letter-spacing: -0.025em;
+  }
+
+  nav[aria-label="Main"] a {
+    padding: 0.375rem 0.5rem;
+    font-size: 0.8125rem;
+    line-height: 1.25;
+  }
+
+  footer[role="contentinfo"] > div {
+    padding: 0.5rem var(--app-mobile-gutter);
+  }
+
+  footer[role="contentinfo"] p {
+    font-size: 0.6875rem;
+    line-height: 1.3;
+  }
+
+  /* --- page intro copy above the deck ----------------------------- */
+  #main-content > div > header > p {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+  }
+
+  /* --- the bill card --------------------------------------------- */
+  [data-testid="bill-card"] {
+    gap: var(--deck-card-gap);
+    padding: var(--deck-card-padding);
+    border-radius: 1rem;
+  }
+
+  [data-testid="bill-card"] > header {
+    gap: 0.5rem;
+  }
+
+  [data-testid="bill-card"] [data-testid="bill-amount"] {
+    font-size: 1.75rem;
+    line-height: 1.15;
+  }
+
+  [data-testid="bill-card"] [role="progressbar"] {
+    height: 0.375rem;
+  }
+
+  /*
+   * The beneficiary story is the only unbounded block on the card. Clamping it
+   * to two lines is what guarantees "Pledge" + "Skip" fit on a 390×844 phone
+   * without scrolling; the full story stays available on /cause/:id.
+   */
+  [data-testid="bill-card"] > p {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+    font-size: 0.8125rem;
+    line-height: 1.45;
+  }
+
+  /* Comfortable tap targets without growing the card. */
+  [data-testid="bill-card"] button {
+    min-height: var(--deck-tap-target);
+    padding-top: 0.5rem;
+    padding-bottom: 0.5rem;
+  }
+
+  /* The action row and details link must sit above the decorative stack. */
+  [data-testid="bill-card"] > div:last-of-type,
+  [data-testid="bill-card"] > a {
+    position: relative;
+    z-index: 1;
+  }
+
+  /* --- empty / missing states ------------------------------------ */
+  [data-testid="empty-state"] {
+    padding: 1.25rem 1rem;
+  }
+
+  [data-testid="empty-state"] a,
+  [data-testid="empty-state"] button {
+    width: 100%;
+    min-height: var(--deck-tap-target);
+  }
+
+  /* --- bill detail (`/cause/:id`) -------------------------------- */
+  [data-testid="cause-amount"] {
+    font-size: 1.75rem;
+    line-height: 1.15;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 4. Short viewports: collapse anything decorative before the CTA.   */
+/* ------------------------------------------------------------------ */
+@media (max-height: 720px) {
+  [data-testid="swipe-deck"] {
+    gap: 0.5rem;
+  }
+
+  [data-testid="bill-card"] > p {
+    -webkit-line-clamp: 1;
+    line-clamp: 1;
+  }
+
+  /*
+   * `data-state="ready"` matters: in the empty / error states the deck's last
+   * child IS the message ("You're all caught up" / "Try again"), so it must
+   * never be hidden here.
+   */
+  [data-testid="swipe-deck"][data-state="ready"] > div:last-child {
+    display: none;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 5. Keyboard focus that stays visible inside the deck and states.   */
+/* ------------------------------------------------------------------ */
+[data-testid="bill-card"] a:focus-visible,
+[data-testid="bill-card"] button:focus-visible,
+[data-testid="empty-state"] a:focus-visible,
+[data-testid="empty-state"] button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+/* ------------------------------------------------------------------ */
+/* 6. Respect the visitor's motion preference.                        */
+/* ------------------------------------------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
