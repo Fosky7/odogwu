@@ -91,20 +91,22 @@ jobs:
             echo "Preflight OK — $FILE_COUNT tracked files, package.json + build script present."
           } 2>&1 | tee -a build.log
 
-      - name: 📦 Setup Bun
-        uses: oven-sh/setup-bun@v1
+      - name: 📦 Setup Node
+        uses: actions/setup-node@v4
         with:
-          bun-version: latest
+          node-version: '22.16.0'
+      - name: Pin npm
+        run: npm install -g npm@10.9.2
 
       # Cache Bun's global install cache keyed on the lockfile so repeat builds
       # (especially rapid preview rebuilds) skip re-downloading dependencies.
       - name: ♻️ Cache dependencies
         uses: actions/cache@v4
         with:
-          path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lockb', '**/package.json') }}
+          path: ~/.npm
+          key: npm-22.16.0-10.9.2-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/package.json', '**/.npmrc') }}
           restore-keys: |
-            bun-${{ runner.os }}-
+            npm-22.16.0-10.9.2-${{ runner.os }}-
 
       # Some user package.json files contain JS-style comments or trailing
       # commas (invalid JSON). esbuild reads package.json when loading
@@ -152,9 +154,7 @@ jobs:
       # deterministic signature classification + auto-fix. GitHub's default
       # shell runs with `pipefail`, so tee never masks a non-zero exit.
       - name: 📥 Install dependencies
-        run: |
-          set -eo pipefail
-          bun install 2>&1 | tee -a build.log
+        run: npm ci --include=dev --no-audit --no-fund 2>&1 | tee -a build.log
 
       # User code frequently imports packages that were never added to
       # package.json (e.g. "lucide-react"), so Rollup fails to resolve the
@@ -294,30 +294,60 @@ jobs:
           for (const c of CORE) {
             if (!fs.existsSync(path.join('node_modules', c))) missing.add(c);
           }
-          const list = [...missing];
+          const foundation = {"react":"^18.3.1","react-dom":"^18.3.1","@tanstack/react-query":"^5.83.0","@supabase/supabase-js":"^2.45.4","lucide-react":"^0.462.0","tailwind-merge":"^2.5.4","class-variance-authority":"^0.7.1","clsx":"^2.1.1","tailwindcss-animate":"^1.0.7","@types/react":"^18.3.3","@types/react-dom":"^18.3.0","@types/node":"^22.16.5","typescript":"^5.6.2","vite":"^5.4.8","tailwindcss":"^3.4.0","autoprefixer":"^10.4.0","postcss":"^8.4.0","@vitejs/plugin-react":"^4.3.1","@vitejs/plugin-react-swc":"^3.7.1","vite-plugin-wasm":"^3.5.0","vite-plugin-top-level-await":"^1.6.0","vite-plugin-node-polyfills":"^0.24.0","lovable-tagger":"^1.1.0","vite-tsconfig-paths":"^5.1.4","@vitejs/plugin-legacy":"^5.4.3","@tanstack/router-plugin":"1.95.1","@tanstack/react-router":"1.95.1"};
+          let manifest = {};
+          try { manifest = JSON.parse(fs.readFileSync('package.json', 'utf8')); } catch (e) {}
+          const declared = { ...foundation, ...manifest.dependencies, ...manifest.devDependencies };
+          const list = [...missing].map(name => declared[name] ? name + '@' + declared[name] : name);
           if (!list.length) { console.log('No missing imports detected.'); process.exit(0); }
           console.log('Installing missing imports: ' + list.join(', '));
           try {
-            const result = cp.spawnSync('bun', ['add', ...list], { stdio: 'inherit', shell: false });
-            if (result.error) throw result.error;
-            if (result.status !== 0) throw new Error('bun add exited with code ' + result.status);
+            throw new Error('Missing imports require a source repair and fresh verification: ' + list.join(', '));
           } catch (e) {
-            console.error('::warning::Could not auto-install some imports: ' + e.message);
+            console.error('::error::' + e.message);
+            process.exit(1);
           }
           RESEOF
           node /tmp/resolve-imports.cjs 2>&1 | tee -a build.log
 
-      - name: 🏗️ Build
+      # Fetch this project's decrypted secrets from KrossBuild and write them to
+      # .env BEFORE the build so Vite bakes the VITE_* values into dist/. Auth is
+      # the low-privilege per-project deploy token (never the service-role key).
+      # The get-build-secrets URL is derived from the ingest URL so no extra repo
+      # secret is required.
+      - name: 🔐 Fetch build secrets
         env:
-          # Nitro only emits a deployable server bundle when it knows the
-          # target. Harmless for non-SSR (Vite ignores it).
-          NITRO_PRESET: netlify
+          INGEST_URL: ${{ secrets.KROSS_INGEST_URL }}
+          PROJECT_ID: ${{ secrets.KROSS_PROJECT_ID }}
+          DEPLOY_TOKEN: ${{ secrets.KROSS_DEPLOY_TOKEN }}
+          ANON_KEY: ${{ secrets.KROSS_ANON_KEY }}
+        run: |
+          {
+            if [ -z "$INGEST_URL" ] || [ -z "$DEPLOY_TOKEN" ]; then
+              echo "::warning::KROSS_* secrets not configured — skipping build-secret injection."
+              exit 0
+            fi
+            SECRETS_URL="${INGEST_URL%/ci-deploy-ingest}/get-build-secrets"
+            echo "Fetching build secrets from KrossBuild…"
+            HTTP=$(curl -sS -w "%{http_code}" -o secrets.json -X POST "$SECRETS_URL" \
+              -H "apikey: $ANON_KEY" \
+              -H "x-kross-deploy-token: $DEPLOY_TOKEN" \
+              -H "content-type: application/json" \
+              -d "{\"projectId\":\"$PROJECT_ID\",\"deploymentId\":\"$KROSS_DEPLOYMENT_ID\"}")
+            if [ "$HTTP" -ge 300 ]; then echo "::error::Failed to fetch build secrets ($HTTP)"; cat secrets.json; exit 1; fi
+            node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('secrets.json','utf8'));fs.writeFileSync('.env',(j.dotenv||'')+'\n');console.log('Wrote '+(j.count||0)+' build secret(s) to .env');"
+            rm -f .env.local .env.production .env.production.local
+            node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('secrets.json','utf8'));fs.writeFileSync('.env',j.dotenv||'');"
+            rm -f secrets.json
+          } 2>&1 | tee -a build.log
+
+      - name: 🏗️ Build
         run: |
           set -eo pipefail
           {
             run_vite_only() {
               echo "↩️ Retrying with a Vite-only build (type-checking decoupled so type-only errors never block the preview/deploy)…"
-              bunx --bun vite build
+              npx --no-install vite build
             }
             if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)" 2>/dev/null; then
               echo "Running package.json build script…"
@@ -327,41 +357,23 @@ jobs:
               # fails, fall back to a Vite-only build (esbuild transpile, no
               # typecheck). Genuine import/syntax errors still fail because
               # `vite build` itself cannot bundle them.
-              bun run build || run_vite_only
+              npm run build
             else
               echo "::warning::No \"build\" script in package.json — falling back to 'bunx vite build'."
-              bunx --bun vite build
+              echo "::error::Missing build script"; exit 1
             fi
           } 2>&1 | tee -a build.log
 
-      # Phase B4 — output-aware packaging. A TanStack Start (SSR) build emits
-      # Nitro's .output/ (assets in .output/public, server bundle shipped as a
-      # Netlify function) instead of dist/. Whatever the build ACTUALLY
-      # produced is what gets zipped, so SSR and SPA trees share one lane.
-      - name: 🗜️ Zip build output
+
+      - name: Record exact build environment
+        run: node .kross/build-provenance.cjs
+
+      - name: 🗜️ Zip dist
         run: |
-          set -eo pipefail
           {
-            if [ -d .output/public ]; then
-              PUBLISH_DIR=.output/public
-              echo "Detected TanStack Start SSR output (.output/)"
-            elif [ -d dist ]; then
-              PUBLISH_DIR=dist
-            else
-              echo "::error::neither dist/ nor .output/public found after build"; exit 1;
-            fi
-            rm -rf /tmp/kross-publish && mkdir -p /tmp/kross-publish
-            cp -R "$PUBLISH_DIR/." /tmp/kross-publish/
-            # Ship the Nitro server bundle as a Netlify function so SSR routes
-            # are actually served instead of falling through to a 404.
-            if [ -d .netlify/functions-internal ]; then
-              mkdir -p /tmp/kross-publish/netlify/functions
-              cp -R .netlify/functions-internal/. /tmp/kross-publish/netlify/functions/
-              echo "Bundled SSR server function(s) into the artifact."
-            fi
-            (cd /tmp/kross-publish && zip -r "$GITHUB_WORKSPACE/dist.zip" .)
-            if [ ! -f "$GITHUB_WORKSPACE/dist.zip" ]; then echo "::error::dist.zip not created"; exit 1; fi
-            echo "Artifact size: $(du -h "$GITHUB_WORKSPACE/dist.zip" | cut -f1)"
+            if [ ! -d dist ]; then echo "::error::dist/ not found after build"; exit 1; fi
+            cd dist && zip -r ../dist.zip . && cd ..
+            echo "Artifact size: $(du -h dist.zip | cut -f1)"
           } 2>&1 | tee -a build.log
 
       - name: 🚀 Upload artifact to KrossBuild
@@ -376,16 +388,13 @@ jobs:
             exit 0
           fi
           echo "Uploading prebuilt artifact to KrossBuild…"
-          if [ ! -f "$GITHUB_WORKSPACE/dist.zip" ]; then
-            echo "::error::dist.zip not found at $GITHUB_WORKSPACE/dist.zip — cannot upload"; exit 1;
-          fi
           HTTP=$(curl -sS -w "%{http_code}" -o response.json -X POST "$INGEST_URL" \
             -H "apikey: $ANON_KEY" \
             -H "x-kross-deploy-token: $DEPLOY_TOKEN" \
             -F "projectId=$PROJECT_ID" \
             -F "deploymentId=$KROSS_DEPLOYMENT_ID" \
             -F "mode=$KROSS_MODE" \
-            -F "artifact=@$GITHUB_WORKSPACE/dist.zip")
+            -F "artifact=@dist.zip")
           echo "Response ($HTTP):"; cat response.json; echo
           if [ "$HTTP" -ge 300 ]; then echo "::error::Deploy upload failed"; exit 1; fi
           echo "✅ Artifact uploaded; KrossBuild is deploying to Netlify."
