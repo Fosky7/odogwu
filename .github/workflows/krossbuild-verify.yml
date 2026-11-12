@@ -1,5 +1,5 @@
 name: Kross Verify
-# KrossBuild bundle-verification lane v15-unset-empty-test-secrets
+# KrossBuild bundle-verification lane v16-dead-link-check
 #
 # Proves that a candidate tree really installs, typechecks and bundles BEFORE
 # KrossBuild publishes it. Never deploys anything.
@@ -219,6 +219,7 @@ jobs:
           const BASE = 'http://127.0.0.1:' + (process.env.KROSS_PREVIEW_PORT || '4173');
           const MAX_ROUTES = 14;
           const PER_ROUTE_MS = 12000;
+          const MAX_LINKS = 40;
 
           /** Walk src/ and mine every declared router path. */
           function discoverRoutes() {
@@ -297,6 +298,7 @@ jobs:
               consoleErrors: [],
               failedRequests: [],
               rootText: 0,
+              links: [],
             };
             const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
             const page = await context.newPage();
@@ -368,8 +370,52 @@ jobs:
               report.status = 'degraded';
             }
 
+            // Collect in-app links (with their visible text) so dead links can be
+            // followed after every page has booted.
+            try {
+              report.links = await page.evaluate(() => Array.from(document.querySelectorAll('a[href]')).map((a) => ({
+                href: a.getAttribute('href') || '',
+                text: ((a.innerText || a.getAttribute('aria-label') || '').trim()).slice(0, 60),
+              })));
+            } catch (e) { report.links = []; }
+
             await context.close();
             return report;
+          }
+
+          /** Text that means the app showed its own "not found" screen. */
+          const NOT_FOUND_RE = /(not found|could ?n.t find|could not find|does ?n.t exist|does not exist|no longer exists|404)/i;
+
+          /** Follow each distinct in-app link once; a link that lands on a not-found screen is dead. */
+          async function checkLinks(browser, reports) {
+            const seen = new Set();
+            const targets = [];
+            for (const r of reports) {
+              for (const l of (r.links || [])) {
+                let href = String(l.href || '').trim();
+                if (!href.startsWith('/') || href.startsWith('//')) continue;
+                href = href.split('#')[0];
+                if (!href || seen.has(href)) continue;
+                seen.add(href);
+                targets.push({ from: r.route, href, text: l.text });
+              }
+            }
+            const dead = [];
+            const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+            const page = await context.newPage();
+            for (const t of targets.slice(0, MAX_LINKS)) {
+              try {
+                const res = await page.goto(BASE + t.href, { waitUntil: 'domcontentloaded', timeout: PER_ROUTE_MS });
+                await page.waitForTimeout(900);
+                const heads = await page.evaluate(() => Array.from(document.querySelectorAll('h1,h2,[role=heading]')).slice(0, 4).map((h) => (h.innerText || '').trim()).join(' | '));
+                const status = res ? res.status() : 200;
+                if (status === 404 || NOT_FOUND_RE.test(heads)) {
+                  dead.push({ from: t.from, href: t.href, text: t.text, shown: heads.slice(0, 120) });
+                }
+              } catch (e) { /* navigation trouble is the boot probe's job, not a dead link */ }
+            }
+            await context.close();
+            return dead;
           }
 
           (async () => {
@@ -390,6 +436,8 @@ jobs:
                 });
               }
             }
+            let deadLinks = [];
+            try { deadLinks = await checkLinks(browser, reports); } catch (e) { deadLinks = []; }
             await browser.close();
 
             const crashed = reports.filter((r) => r.status === 'crashed');
@@ -410,13 +458,21 @@ jobs:
                 diagnostics.push({ file: null, line: null, column: null, code: 'RUNTIME_EMPTY', message: r.route + ' — rendered an empty page.' });
               }
             }
+            for (const d of deadLinks) {
+              diagnostics.push({
+                file: null, line: null, column: null, code: 'LINK_DEAD',
+                message: 'Dead link on ' + d.from + ': "' + (d.text || d.href) + '" goes to ' + d.href + ' which shows "' + d.shown + '". Point this link at a record that exists (use the same id/slug the destination page looks up), or make the destination page find it. Do not change tests.',
+              });
+            }
             for (const r of degraded.slice(0, 5)) {
               const first = r.consoleErrors[0] || (r.failedRequests[0] ? r.failedRequests[0].reason + ' ' + r.failedRequests[0].url : '');
               diagnostics.push({ file: null, line: null, column: null, code: 'RUNTIME_DEGRADED', message: r.route + ' — ' + String(first).slice(0, 300) });
             }
 
+            const failed = crashed.length > 0 || deadLinks.length > 0;
             const out = {
-              status: crashed.length > 0 ? 'failed' : 'passed',
+              status: failed ? 'failed' : 'passed',
+              deadLinks: deadLinks.slice(0, 10),
               routesChecked: reports.length,
               routesCrashed: crashed.length,
               routesDegraded: degraded.length,
@@ -429,14 +485,16 @@ jobs:
               })),
               diagnostics: diagnostics.slice(0, 30),
               summary:
-                crashed.length > 0
+                deadLinks.length > 0 && crashed.length === 0
+                  ? deadLinks.length + ' dead link(s): ' + deadLinks.slice(0, 4).map((d) => d.from + ' -> ' + d.href).join(', ')
+                  : crashed.length > 0
                   ? crashed.length + ' of ' + reports.length + ' route(s) failed to boot: ' + crashed.map((r) => r.route).join(', ')
                   : reports.length + ' route(s) booted clean' + (degraded.length ? ' (' + degraded.length + ' with console/network warnings)' : '') + '.',
             };
 
             fs.writeFileSync('/tmp/kross-runtime.json', JSON.stringify(out));
             console.log(out.summary);
-            process.exit(crashed.length > 0 ? 1 : 0);
+            process.exit(failed ? 1 : 0);
           })().catch((e) => {
             // Probe infrastructure failure -> FAIL OPEN. We never block a publish on our
             // own tooling breaking; absence of evidence is not evidence of breakage.
