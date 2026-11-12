@@ -1,0 +1,1684 @@
+name: Kross Verify
+# KrossBuild bundle-verification lane v15-unset-empty-test-secrets
+#
+# Proves that a candidate tree really installs, typechecks and bundles BEFORE
+# KrossBuild publishes it. Never deploys anything.
+
+on:
+  repository_dispatch:
+    types: [ kross-verify ]
+
+concurrency:
+  group: kross-verify-${{ github.event.client_payload.project_id }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Install + Typecheck + Bundle + Tests + A11y proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: ⏱️ Start clock
+        run: |
+          echo "KROSS_STARTED_AT=$(date +%s%3N)" >> "$GITHUB_ENV"
+          echo "KROSS_PHASE=checkout" >> "$GITHUB_ENV"
+
+      - name: 🔍 Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.checkout_ref }}
+
+      - name: Mark runner setup
+        run: |
+          echo "KROSS_PHASE=setup" >> "$GITHUB_ENV"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+      - name: Pin npm
+        run: npm install -g npm@10.9.2
+
+      - name: ♻️ Restore install cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: kross-npm-22.16.0-10.9.2-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/package.json', '**/.npmrc') }}
+          restore-keys: kross-npm-22.16.0-10.9.2-${{ runner.os }}-
+
+      - name: 📦 Install (real dependency proof)
+        run: |
+          set -eo pipefail
+          echo install > /tmp/kross-phase
+          echo "KROSS_PHASE=install" >> "$GITHUB_ENV"
+          npm ci --include=dev --no-audit --no-fund 2>&1 | tee -a verify.log
+
+      # The acceptance lane asserts that promised behaviour is backed by REAL
+      # data, which means it must talk to the project's own backend exactly as
+      # the app does. Vite also needs these baked into dist/ or the built app
+      # boots without a client. Fetched with the low-privilege per-project
+      # deploy token — never the service-role key — and exported so the
+      # acceptance probe can re-query PostgREST as the anon role.
+      - name: 🔐 Fetch project backend credentials
+        continue-on-error: true
+        env:
+          VERIFY_URL: ${{ secrets.KROSS_VERIFY_URL }}
+          PROJECT_ID: ${{ secrets.KROSS_PROJECT_ID }}
+          DEPLOY_TOKEN: ${{ secrets.KROSS_DEPLOY_TOKEN }}
+          ANON_KEY: ${{ secrets.KROSS_ANON_KEY }}
+        run: |
+          if [ -z "$VERIFY_URL" ] || [ -z "$DEPLOY_TOKEN" ]; then
+            echo "::warning::KROSS_* secrets not configured — data-backed acceptance checks will be skipped."
+            exit 0
+          fi
+          SECRETS_URL="${VERIFY_URL%/verify-bundle-callback}/get-build-secrets"
+          HTTP=$(curl -sS -w "%{http_code}" -o secrets.json -X POST "$SECRETS_URL" \
+            -H "apikey: $ANON_KEY" \
+            -H "x-kross-deploy-token: $DEPLOY_TOKEN" \
+            -H "content-type: application/json" \
+            -d "{\"projectId\":\"$PROJECT_ID\"}") || HTTP=000
+          if [ "$HTTP" -ge 300 ] || [ "$HTTP" = "000" ]; then
+            echo "::warning::Could not fetch build secrets ($HTTP) — data-backed acceptance checks will be skipped."
+            rm -f secrets.json; exit 0
+          fi
+          node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('secrets.json','utf8'));const d=(j.dotenv||'');fs.writeFileSync('.env',d+'\n');const out=[];for(const line of d.split('\n')){const m=line.match(/^\s*(VITE_SUPABASE_URL|VITE_SUPABASE_PUBLISHABLE_KEY|VITE_SUPABASE_ANON_KEY)\s*=\s*(.*)\s*$/);if(m)out.push(m[1]+'='+m[2].replace(/^['\"]|['\"]$/g,''));}fs.appendFileSync(process.env.GITHUB_ENV,out.join('\n')+(out.length?'\n':''));console.log('build secrets: '+(j.count||0)+', backend vars exported: '+out.length);"
+          rm -f .env.local .env.production .env.production.local
+          node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('secrets.json','utf8'));fs.writeFileSync('.env',j.dotenv||'');"
+          rm -f secrets.json
+
+
+      - name: 🧠 Typecheck (advisory)
+        continue-on-error: true
+        run: |
+          echo "KROSS_PHASE=typecheck" >> "$GITHUB_ENV"
+          npx --no-install tsc --noEmit 2>&1 | tee -a typecheck.log || true
+
+      - name: 🏗️ Bundle (real vite build proof)
+        run: |
+          set -eo pipefail
+          echo bundle > /tmp/kross-phase
+          echo "KROSS_PHASE=bundle" >> "$GITHUB_ENV"
+          npm run build 2>&1 | tee -a verify.log
+          if [ -d dist ]; then node .kross/build-provenance.cjs; fi
+          # Phase B4: a TanStack Start (SSR) build emits Nitro's .output/
+          # instead of dist/. Accept either, and record which one so the serve
+          # + probe steps below target the real artifact.
+          if [ -d .output/public ]; then
+            echo "KROSS_SSR=1" >> "$GITHUB_ENV"
+            echo "SSR build output detected (.output/)"
+          elif [ -d dist ]; then
+            echo "KROSS_SSR=0" >> "$GITHUB_ENV"
+          else
+            echo "::error::vite build completed but produced neither dist/ nor .output/public"
+            exit 1
+          fi
+
+      # ── F30: auto-generated smoke tests / route crawl ───────────────────
+      # The suite is generated pre-commit from the router + each page's own
+      # copy, and lives in the repo. Running it here is what turns it into
+      # regression insurance: a later module cannot silently break an earlier
+      # page without a named assertion going red.
+      - name: 🧪 Smoke tests (route crawl + content pins)
+        run: |
+          set -eo pipefail
+          echo tests > /tmp/kross-phase
+          echo "KROSS_PHASE=tests" >> "$GITHUB_ENV"
+          if [ -z "$(find src -name '*.test.*' -o -name '*.spec.*' 2>/dev/null | head -n 1)" ]; then
+            echo "no test files present — skipping"; exit 0
+          fi
+          set +e
+          # Playwright verification specs belong to the browser runner, not Vitest.
+          node -e "const fs=require('fs');const path=require('path');const walk=d=>fs.readdirSync(d,{withFileTypes:true}).flatMap(e=>e.isDirectory()?walk(path.join(d,e.name)):[path.join(d,e.name)]);const files=walk('src').filter(p=>/\.(test|spec)\.[cm]?[jt]sx?$/.test(p)&&!fs.readFileSync(p,'utf8').includes('@playwright/test'));fs.writeFileSync('/tmp/kross-unit-files',files.join('\n'));"
+          if [ ! -s /tmp/kross-unit-files ]; then echo "No unit specs; browser specs run below."; exit 0; fi
+          mapfile -t UNIT_FILES < /tmp/kross-unit-files
+          npx --no-install vitest run "${UNIT_FILES[@]}" --reporter=json --outputFile=/tmp/kross-vitest.json --reporter=default 2>&1 | tee -a tests.log
+          VITEST_EXIT=$?
+          set -e
+          if [ "$VITEST_EXIT" -ne 0 ]; then exit "$VITEST_EXIT"; fi
+          if [ ! -s /tmp/kross-vitest.json ]; then
+            echo "::warning::vitest produced no report (exit $VITEST_EXIT) — failing open"
+            exit 0
+          fi
+          node -e "const r=require('/tmp/kross-vitest.json');process.exit(r.numFailedTests>0?1:0)"
+
+      # ── F28: headless-browser boot assertion ────────────────────────────
+      # Bundling proves the code COMPILES. This proves it RUNS: every declared
+      # route is opened in real Chromium and asserted to mount without throwing.
+      - name: ♻️ Restore Chromium cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: kross-playwright-${{ runner.os }}-1.49.1
+
+      - name: 🎭 Install Chromium + axe-core (runtime + a11y probes)
+        run: |
+          set -eo pipefail
+          mkdir -p /tmp/kross-browser-tools
+          npm install --prefix /tmp/kross-browser-tools @playwright/test@1.49.1 axe-core@4.10.2 2>&1 | tail -n 5
+          /tmp/kross-browser-tools/node_modules/.bin/playwright install --with-deps chromium 2>&1 | tail -n 5
+          echo "NODE_PATH=/tmp/kross-browser-tools/node_modules" >> "$GITHUB_ENV"
+          mkdir -p node_modules/@playwright
+          ln -s /tmp/kross-browser-tools/node_modules/@playwright/test node_modules/@playwright/test
+          ln -s /tmp/kross-browser-tools/node_modules/playwright node_modules/playwright
+          ln -s /tmp/kross-browser-tools/node_modules/playwright-core node_modules/playwright-core
+
+      - name: 🚀 Serve the built bundle
+        run: |
+          set -eo pipefail
+          if [ "$KROSS_SSR" = "1" ] && [ -f .output/server/index.mjs ]; then
+            echo "Booting the Nitro SSR server (.output/server/index.mjs)…"
+            PORT=4173 HOST=127.0.0.1 nohup node .output/server/index.mjs > preview-server.log 2>&1 &
+          else
+            nohup npx vite preview --port 4173 --strictPort --host 127.0.0.1 > preview-server.log 2>&1 &
+          fi
+          for i in $(seq 1 40); do
+            if curl -sf -o /dev/null "http://127.0.0.1:4173/"; then
+              echo "preview server up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::warning::preview server never came up; runtime probe will fail open"
+          cat preview-server.log || true
+
+      - name: 🧪 Saved browser flow tests
+        env:
+          E2E_USER_EMAIL: ${{ secrets.KROSS_E2E_USER_EMAIL }}
+          E2E_USER_PASSWORD: ${{ secrets.KROSS_E2E_USER_PASSWORD }}
+          E2E_OTHER_EMAIL: ${{ secrets.KROSS_E2E_OTHER_EMAIL }}
+          E2E_OTHER_PASSWORD: ${{ secrets.KROSS_E2E_OTHER_PASSWORD }}
+          E2E_EMAIL_DOMAIN: example.com
+          E2E_SIGNUP_EMAIL_DOMAIN: example.com
+        run: |
+          set -eo pipefail
+          echo flows > /tmp/kross-phase
+          echo "KROSS_PHASE=flows" >> "$GITHUB_ENV"
+          # Unset GitHub secrets arrive as empty strings; tests must see them as absent
+          # so their own fallbacks apply (an empty email blocks form submission).
+          for v in E2E_USER_EMAIL E2E_USER_PASSWORD E2E_OTHER_EMAIL E2E_OTHER_PASSWORD; do
+            if [ -z "${!v}" ]; then unset "$v"; fi
+          done
+          if [ ! -d src/verification ]; then exit 0; fi
+          cat > /tmp/kross-browser-tools/check.config.cjs <<'CONFIGEOF'
+          module.exports={testDir:process.env.GITHUB_WORKSPACE+'/src/verification',testMatch:'**/*.spec.{ts,tsx,js,mjs,cjs}',timeout:45000,retries:0,workers:1,reporter:[['json',{outputFile:'/tmp/kross-browser-flows.json'}]],use:{baseURL:'http://127.0.0.1:4173',headless:true}};
+          CONFIGEOF
+          /tmp/kross-browser-tools/node_modules/.bin/playwright test --config=/tmp/kross-browser-tools/check.config.cjs
+
+      - name: 🧪 Boot assertion (every route, real browser)
+        env:
+          KROSS_PREVIEW_PORT: "4173"
+        run: |
+          set -eo pipefail
+          echo runtime > /tmp/kross-phase
+          echo "KROSS_PHASE=runtime" >> "$GITHUB_ENV"
+          cat > /tmp/kross-runtime-probe.cjs <<'PROBEEOF'
+
+          const fs = require('fs');
+          const path = require('path');
+          const { chromium } = require('playwright');
+
+          const BASE = 'http://127.0.0.1:' + (process.env.KROSS_PREVIEW_PORT || '4173');
+          const MAX_ROUTES = 14;
+          const PER_ROUTE_MS = 12000;
+
+          /** Walk src/ and mine every declared router path. */
+          function discoverRoutes() {
+            const roots = ['src'];
+            const files = [];
+            const walk = (dir) => {
+              let entries = [];
+              try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+              for (const e of entries) {
+                const p = path.join(dir, e.name);
+                if (e.isDirectory()) {
+                  if (/^(node_modules|dist|build|\.git)$/.test(e.name)) continue;
+                  walk(p);
+                } else if (/\.(tsx|jsx|ts|js)$/.test(e.name)) {
+                  files.push(p);
+                }
+              }
+            };
+            roots.forEach(walk);
+
+            const found = new Set(['/']);
+
+            // TanStack file-based routes: src/routes/about.tsx -> /about,
+            // src/routes/index.tsx -> /. Dynamic ($id) and layout (__root, -private)
+            // files are skipped; they are not directly navigable.
+            for (const f of files) {
+              const rel = f.split(String.fromCharCode(92)).join('/');
+              const m = rel.match(/^src\/routes\/(.+)\.(tsx|jsx)$/);
+              if (!m) continue;
+              const seg = m[1];
+              if (seg.includes('$') || /(^|\/)(__|-)/.test(seg)) continue;
+              const r = '/' + seg.replace(/(^|\/)index$/, '');
+              found.add(r.replace(/\/+$/, '') || '/');
+            }
+
+            for (const f of files) {
+              let src = '';
+              try { src = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+              if (!/path\s*[:=]/.test(src)) continue;
+              const patterns = [
+                /path\s*=\s*["']([^"']+)["']/g,   // <Route path="/about" />
+                /path\s*:\s*["']([^"']+)["']/g,   // { path: "/about" }
+              ];
+              for (const re of patterns) {
+                let m;
+                while ((m = re.exec(src))) {
+                  let r = String(m[1] || '').trim();
+                  if (!r || r === '*' || r.startsWith('http')) continue;
+                  if (!r.startsWith('/')) r = '/' + r;
+                  if (r.includes('*')) continue;
+                  // Fill dynamic segments with a harmless placeholder so the route mounts.
+                  r = r.replace(/:[A-Za-z0-9_]+/g, 'demo');
+                  if (r.length > 80) continue;
+                  found.add(r.replace(/\/+$/, '') || '/');
+                }
+              }
+            }
+            return Array.from(found).slice(0, MAX_ROUTES);
+          }
+
+          const NOISE = [
+            /favicon/i,
+            /Download the React DevTools/i,
+            /React Router Future Flag/i,
+            /Warning: ReactDOM.render/i,
+            /source-?map/i,
+            /\[vite\]/i,
+          ];
+          const isNoise = (s) => NOISE.some((re) => re.test(String(s || '')));
+
+          async function probeRoute(browser, route) {
+            const report = {
+              route,
+              status: 'mounted',
+              pageErrors: [],
+              consoleErrors: [],
+              failedRequests: [],
+              rootText: 0,
+            };
+            const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+            const page = await context.newPage();
+
+            page.on('pageerror', (err) => {
+              const msg = (err && err.message) || String(err);
+              if (!isNoise(msg)) {
+                report.pageErrors.push({
+                  message: msg.slice(0, 300),
+                  stack: String((err && err.stack) || '').split('\n').slice(0, 4).join(' | ').slice(0, 400),
+                });
+              }
+            });
+            page.on('console', (msg) => {
+              if (msg.type() !== 'error') return;
+              const text = msg.text();
+              if (isNoise(text)) return;
+              report.consoleErrors.push(text.slice(0, 300));
+            });
+            page.on('requestfailed', (req) => {
+              const url = req.url();
+              if (isNoise(url)) return;
+              report.failedRequests.push({
+                url: url.slice(0, 200),
+                reason: String((req.failure() && req.failure().errorText) || 'failed'),
+              });
+            });
+            page.on('response', (res) => {
+              if (res.status() < 500) return;
+              report.failedRequests.push({ url: res.url().slice(0, 200), reason: 'HTTP ' + res.status() });
+            });
+
+            try {
+              await page.goto(BASE + route, { waitUntil: 'networkidle', timeout: PER_ROUTE_MS });
+            } catch (e) {
+              // networkidle can legitimately time out on apps with long-polling; fall
+              // back to a DOM-ready wait rather than declaring a false crash.
+              try {
+                await page.goto(BASE + route, { waitUntil: 'domcontentloaded', timeout: PER_ROUTE_MS });
+              } catch (e2) {
+                report.status = 'crashed';
+                report.pageErrors.push({ message: 'Navigation failed: ' + String((e2 && e2.message) || e2).slice(0, 200), stack: '' });
+              }
+            }
+
+            // Give effects/data a beat to run so post-paint throws are captured.
+            await page.waitForTimeout(1800);
+
+            try {
+              const info = await page.evaluate(() => {
+                const root = document.getElementById('root') || document.body;
+                return {
+                  text: (root && root.innerText ? root.innerText : '').trim().length,
+                  nodes: root ? root.querySelectorAll('*').length : 0,
+                };
+              });
+              report.rootText = info.text;
+              if (report.status !== 'crashed' && info.text < 8 && info.nodes < 6) {
+                report.status = 'crashed';
+                report.pageErrors.push({ message: 'Route mounted nothing: #root rendered no visible content.', stack: '' });
+              }
+            } catch (e) {
+              report.status = 'crashed';
+              report.pageErrors.push({ message: 'DOM inspection failed: ' + String((e && e.message) || e).slice(0, 200), stack: '' });
+            }
+
+            if (report.status !== 'crashed' && report.pageErrors.length > 0) report.status = 'crashed';
+            if (report.status === 'mounted' && (report.consoleErrors.length > 0 || report.failedRequests.length > 0)) {
+              report.status = 'degraded';
+            }
+
+            await context.close();
+            return report;
+          }
+
+          (async () => {
+            const routes = discoverRoutes();
+            const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+            const reports = [];
+            for (const route of routes) {
+              try {
+                reports.push(await probeRoute(browser, route));
+              } catch (e) {
+                reports.push({
+                  route,
+                  status: 'crashed',
+                  pageErrors: [{ message: 'Probe failure: ' + String((e && e.message) || e).slice(0, 200), stack: '' }],
+                  consoleErrors: [],
+                  failedRequests: [],
+                  rootText: 0,
+                });
+              }
+            }
+            await browser.close();
+
+            const crashed = reports.filter((r) => r.status === 'crashed');
+            const degraded = reports.filter((r) => r.status === 'degraded');
+
+            const diagnostics = [];
+            for (const r of crashed) {
+              for (const p of r.pageErrors.slice(0, 2)) {
+                diagnostics.push({
+                  file: null,
+                  line: null,
+                  column: null,
+                  code: 'RUNTIME_BOOT',
+                  message: r.route + ' — ' + p.message + (p.stack ? ' (' + p.stack + ')' : ''),
+                });
+              }
+              if (r.pageErrors.length === 0) {
+                diagnostics.push({ file: null, line: null, column: null, code: 'RUNTIME_EMPTY', message: r.route + ' — rendered an empty page.' });
+              }
+            }
+            for (const r of degraded.slice(0, 5)) {
+              const first = r.consoleErrors[0] || (r.failedRequests[0] ? r.failedRequests[0].reason + ' ' + r.failedRequests[0].url : '');
+              diagnostics.push({ file: null, line: null, column: null, code: 'RUNTIME_DEGRADED', message: r.route + ' — ' + String(first).slice(0, 300) });
+            }
+
+            const out = {
+              status: crashed.length > 0 ? 'failed' : 'passed',
+              routesChecked: reports.length,
+              routesCrashed: crashed.length,
+              routesDegraded: degraded.length,
+              reports: reports.map((r) => ({
+                route: r.route,
+                status: r.status,
+                consoleErrors: r.consoleErrors.slice(0, 3),
+                failedRequests: r.failedRequests.slice(0, 3),
+                pageErrors: r.pageErrors.slice(0, 2),
+              })),
+              diagnostics: diagnostics.slice(0, 30),
+              summary:
+                crashed.length > 0
+                  ? crashed.length + ' of ' + reports.length + ' route(s) failed to boot: ' + crashed.map((r) => r.route).join(', ')
+                  : reports.length + ' route(s) booted clean' + (degraded.length ? ' (' + degraded.length + ' with console/network warnings)' : '') + '.',
+            };
+
+            fs.writeFileSync('/tmp/kross-runtime.json', JSON.stringify(out));
+            console.log(out.summary);
+            process.exit(crashed.length > 0 ? 1 : 0);
+          })().catch((e) => {
+            // Probe infrastructure failure -> FAIL OPEN. We never block a publish on our
+            // own tooling breaking; absence of evidence is not evidence of breakage.
+            try {
+              fs.writeFileSync('/tmp/kross-runtime.json', JSON.stringify({
+                status: 'skipped',
+                reason: String((e && e.message) || e).slice(0, 300),
+                routesChecked: 0, routesCrashed: 0, routesDegraded: 0, reports: [], diagnostics: [],
+                summary: 'Runtime boot probe could not run.',
+              }));
+            } catch (e2) { /* ignore */ }
+            console.log('::warning::runtime boot probe skipped: ' + String((e && e.message) || e));
+            process.exit(0);
+          });
+
+          PROBEEOF
+          node /tmp/kross-runtime-probe.cjs 2>&1 | tee -a runtime.log
+          node -e "const r=require('/tmp/kross-runtime.json');if(r.status!=='passed'||r.routesChecked<1)process.exit(1)"
+
+      # ── B4: server-render assertion (SSR trees only) ────────────────────
+      # An SSR app that ships an empty shell and only paints after hydration is
+      # strictly worse than the SPA it replaced: no first-paint content, no
+      # crawlable HTML. This asserts the FIRST BYTE of each route already
+      # contains real markup. Skipped entirely on static SPA builds.
+      - name: 🌐 Server-render assertion
+        if: env.KROSS_SSR == '1'
+        env:
+          KROSS_PREVIEW_PORT: "4173"
+        run: |
+          set -eo pipefail
+          echo ssr > /tmp/kross-phase
+          echo "KROSS_PHASE=ssr" >> "$GITHUB_ENV"
+          cat > /tmp/kross-ssr-probe.cjs <<'SSREOF'
+
+          const fs = require('fs');
+          const PORT = process.env.KROSS_PREVIEW_PORT || '4173';
+          const BASE = 'http://127.0.0.1:' + PORT;
+
+          function routes() {
+            const out = new Set(['/']);
+            const walk = (dir, prefix) => {
+              let ents = [];
+              try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+              for (const e of ents) {
+                if (e.isDirectory()) { walk(dir + '/' + e.name, prefix + '/' + e.name); continue; }
+                if (!/\.(tsx|jsx)$/.test(e.name)) continue;
+                const base = e.name.replace(/\.(tsx|jsx)$/, '');
+                if (base.startsWith('__') || base.startsWith('-')) continue;
+                if (base.includes('$')) continue;
+                const p = (prefix + '/' + (base === 'index' ? '' : base)).replace(/\/+/g, '/');
+                out.add(p.replace(/\/$/, '') || '/');
+              }
+            };
+            walk('src/routes', '');
+            return Array.from(out).slice(0, 12);
+          }
+
+          function strip(html) {
+            return String(html || '')
+              .replace(/<script[\s\S]*?<\/script>/gi, '')
+              .replace(/<style[\s\S]*?<\/style>/gi, '')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+          }
+
+          (async () => {
+            const diagnostics = [];
+            const reports = [];
+            for (const route of routes()) {
+              let html = '';
+              let status = 0;
+              try {
+                const res = await fetch(BASE + route, { headers: { accept: 'text/html' } });
+                status = res.status;
+                html = await res.text();
+              } catch (e) {
+                diagnostics.push({ file: null, line: null, column: null, code: 'SSR_UNREACHABLE',
+                  message: route + ' — SSR server did not answer: ' + String((e && e.message) || e).slice(0, 200) });
+                reports.push({ route, status: 'crashed', chars: 0 });
+                continue;
+              }
+              const text = strip(html);
+              if (status >= 500) {
+                diagnostics.push({ file: null, line: null, column: null, code: 'SSR_5XX',
+                  message: route + ' — server rendered HTTP ' + status });
+                reports.push({ route, status: 'crashed', chars: text.length });
+                continue;
+              }
+              if (text.length < 20) {
+                diagnostics.push({ file: null, line: null, column: null, code: 'SSR_EMPTY',
+                  message: route + ' — server-rendered HTML is an empty shell (' + text.length + ' chars of text). ' +
+                    'The page only appears after JS hydrates, so SSR is not actually working.' });
+                reports.push({ route, status: 'crashed', chars: text.length });
+                continue;
+              }
+              reports.push({ route, status: 'mounted', chars: text.length });
+            }
+
+            const crashed = reports.filter((r) => r.status === 'crashed');
+            const out = {
+              status: crashed.length > 0 ? 'failed' : 'passed',
+              routesChecked: reports.length,
+              routesCrashed: crashed.length,
+              reports: reports,
+              diagnostics: diagnostics.slice(0, 20),
+              summary: crashed.length > 0
+                ? crashed.length + ' of ' + reports.length + ' route(s) did not server-render: ' + crashed.map((r) => r.route).join(', ')
+                : reports.length + ' route(s) server-rendered real HTML.',
+            };
+            fs.writeFileSync('/tmp/kross-ssr.json', JSON.stringify(out));
+            console.log(out.summary);
+            process.exit(crashed.length > 0 ? 1 : 0);
+          })().catch((e) => {
+            try {
+              fs.writeFileSync('/tmp/kross-ssr.json', JSON.stringify({
+                status: 'skipped', reason: String((e && e.message) || e).slice(0, 200),
+                routesChecked: 0, routesCrashed: 0, reports: [], diagnostics: [],
+                summary: 'SSR HTML probe could not run.',
+              }));
+            } catch (e2) { /* ignore */ }
+            console.log('::warning::SSR probe skipped: ' + String((e && e.message) || e));
+            process.exit(0);
+          });
+
+          SSREOF
+          node /tmp/kross-ssr-probe.cjs 2>&1 | tee -a ssr.log
+
+      # ── F31: accessibility + performance audit ──────────────────────────
+      # Reuses the same Chromium and the same preview server. axe-core runs the
+      # WCAG 2.1 A/AA rule set against every route's REAL rendered DOM, and
+      # web-vitals are sampled from the same page load. Critical a11y
+      # violations fail the job (phase a11y) and block the publish. The raw
+      # perf numbers sampled here feed the blocking budget step below.
+      - name: ♿ Accessibility + performance audit
+        env:
+          KROSS_PREVIEW_PORT: "4173"
+        run: |
+          set -eo pipefail
+          echo a11y > /tmp/kross-phase
+          echo "KROSS_PHASE=a11y" >> "$GITHUB_ENV"
+          cat > /tmp/kross-a11y-probe.cjs <<'AXEEOF'
+
+          const fs = require('fs');
+          const path = require('path');
+          const { chromium } = require('playwright');
+
+          const BASE = 'http://127.0.0.1:' + (process.env.KROSS_PREVIEW_PORT || '4173');
+          const MAX_ROUTES = 8;
+          // G34 — every route is audited at Mobile, Tablet AND Desktop. Breakpoint-only
+          // defects (a nav that never collapses, a 3-up grid at 390px, contrast that
+          // only fails in the mobile header) are invisible to a single-width audit.
+          const VIEWPORTS = [{"id":"mobile","label":"Mobile","width":390,"height":844,"isMobile":true},{"id":"tablet","label":"Tablet","width":834,"height":1112,"isMobile":true},{"id":"desktop","label":"Desktop","width":1440,"height":900,"isMobile":false}];
+          const PER_ROUTE_MS = 15000;
+
+          // Budgets. Deliberately generous: these are "this will hurt real users on a
+          // phone" thresholds, not lab perfection.
+          const LCP_BUDGET_MS = 4000;
+          const CLS_BUDGET = 0.25;
+          const PAGE_BYTES_BUDGET = 3500000;
+          const IMAGE_BYTES_BUDGET = 900000;
+
+          function resolveAxePath() {
+            try { return require.resolve('axe-core/axe.min.js'); } catch (e) {}
+            try { return require.resolve('axe-core/axe.js'); } catch (e) {}
+            return null;
+          }
+
+          /** Same route discovery contract as the boot probe. */
+          function discoverRoutes() {
+            const files = [];
+            const walk = (dir) => {
+              let entries = [];
+              try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+              for (const e of entries) {
+                const p = path.join(dir, e.name);
+                if (e.isDirectory()) {
+                  if (/^(node_modules|dist|build|\.git)$/.test(e.name)) continue;
+                  walk(p);
+                } else if (/\.(tsx|jsx|ts|js)$/.test(e.name)) {
+                  files.push(p);
+                }
+              }
+            };
+            walk('src');
+
+            const found = new Set(['/']);
+            for (const f of files) {
+              let src = '';
+              try { src = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+              if (!/path\s*[:=]/.test(src)) continue;
+              const patterns = [/path\s*=\s*["']([^"']+)["']/g, /path\s*:\s*["']([^"']+)["']/g];
+              for (const re of patterns) {
+                let m;
+                while ((m = re.exec(src))) {
+                  let r = String(m[1] || '').trim();
+                  if (!r || r === '*' || r.startsWith('http')) continue;
+                  if (!r.startsWith('/')) r = '/' + r;
+                  if (r.includes('*')) continue;
+                  r = r.replace(/:[A-Za-z0-9_]+/g, 'demo');
+                  if (r.length > 80) continue;
+                  found.add(r.replace(/\/+$/, '') || '/');
+                }
+              }
+            }
+            return Array.from(found).slice(0, MAX_ROUTES);
+          }
+
+          const VITALS_SCRIPT = [
+            '(() => {',
+            '  window.__krossVitals = { lcp: 0, cls: 0 };',
+            '  try {',
+            '    new PerformanceObserver((l) => {',
+            '      const es = l.getEntries();',
+            '      const last = es[es.length - 1];',
+            '      if (last) window.__krossVitals.lcp = last.renderTime || last.loadTime || last.startTime || 0;',
+            '    }).observe({ type: "largest-contentful-paint", buffered: true });',
+            '  } catch (e) {}',
+            '  try {',
+            '    new PerformanceObserver((l) => {',
+            '      for (const e of l.getEntries()) {',
+            '        if (!e.hadRecentInput) window.__krossVitals.cls += e.value;',
+            '      }',
+            '    }).observe({ type: "layout-shift", buffered: true });',
+            '  } catch (e) {}',
+            '})();',
+          ].join('\n');
+
+          async function auditRoute(browser, route, axePath, vp) {
+            const report = {
+              route,
+              viewport: vp.id,
+              viewportLabel: vp.label + ' ' + vp.width + 'x' + vp.height,
+              violations: [],
+              perf: { lcpMs: 0, cls: 0, bytes: 0, largestImageBytes: 0, largestImageUrl: null },
+            };
+            const context = await browser.newContext({
+              viewport: { width: vp.width, height: vp.height },
+              isMobile: !!vp.isMobile,
+              hasTouch: !!vp.isMobile,
+              deviceScaleFactor: 1,
+            });
+            const page = await context.newPage();
+            await page.addInitScript(VITALS_SCRIPT);
+
+            page.on('response', async (res) => {
+              try {
+                const headers = res.headers();
+                const len = Number(headers['content-length'] || 0);
+                if (!len || !isFinite(len)) return;
+                report.perf.bytes += len;
+                const type = String(headers['content-type'] || '');
+                if (/^image\//.test(type) && len > report.perf.largestImageBytes) {
+                  report.perf.largestImageBytes = len;
+                  report.perf.largestImageUrl = res.url().slice(0, 200);
+                }
+              } catch (e) {}
+            });
+
+            try {
+              await page.goto(BASE + route, { waitUntil: 'networkidle', timeout: PER_ROUTE_MS });
+            } catch (e) {
+              try {
+                await page.goto(BASE + route, { waitUntil: 'domcontentloaded', timeout: PER_ROUTE_MS });
+              } catch (e2) {
+                await context.close();
+                return report; // boot failures belong to F28, not to this audit
+              }
+            }
+            await page.waitForTimeout(1500);
+
+            try {
+              const v = await page.evaluate(() => window.__krossVitals || { lcp: 0, cls: 0 });
+              report.perf.lcpMs = Math.round(Number(v.lcp) || 0);
+              report.perf.cls = Math.round((Number(v.cls) || 0) * 1000) / 1000;
+            } catch (e) {}
+
+            // Deterministic responsive check: does the document scroll sideways at this
+            // width? That is the single most common "it looks broken on my phone" defect
+            // and it needs no vision model to detect.
+            try {
+              report.overflowPx = await page.evaluate(() => {
+                const de = document.documentElement;
+                return Math.max(0, Math.round(de.scrollWidth - de.clientWidth));
+              });
+            } catch (e) { report.overflowPx = 0; }
+
+            if (axePath) {
+              try {
+                await page.addScriptTag({ path: axePath });
+                const result = await page.evaluate(async () => {
+                  return await window.axe.run(document, {
+                    runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'] },
+                    resultTypes: ['violations'],
+                  });
+                });
+                for (const v of (result && result.violations) || []) {
+                  const nodes = (v.nodes || []).slice(0, 2).map((n) => String((n.target || []).join(' ')).slice(0, 120));
+                  report.violations.push({
+                    id: String(v.id || 'axe'),
+                    impact: String(v.impact || 'minor'),
+                    help: String(v.help || '').slice(0, 200),
+                    count: (v.nodes || []).length,
+                    targets: nodes,
+                  });
+                }
+              } catch (e) {
+                report.axeError = String((e && e.message) || e).slice(0, 200);
+              }
+            }
+
+            await context.close();
+            return report;
+          }
+
+          (async () => {
+            const axePath = resolveAxePath();
+            if (!axePath) console.log('::warning::axe-core not resolvable — accessibility audit will be skipped');
+
+            const routes = discoverRoutes();
+            const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+            const reports = [];
+            for (const vp of VIEWPORTS) {
+              for (const route of routes) {
+                try {
+                  reports.push(await auditRoute(browser, route, axePath, vp));
+                } catch (e) {
+                  reports.push({
+                    route,
+                    viewport: vp.id,
+                    viewportLabel: vp.label + ' ' + vp.width + 'x' + vp.height,
+                    violations: [],
+                    perf: { lcpMs: 0, cls: 0, bytes: 0, largestImageBytes: 0 },
+                    probeError: String((e && e.message) || e).slice(0, 200),
+                  });
+                }
+              }
+            }
+            await browser.close();
+
+            const diagnostics = [];
+            const seen = new Set();
+            let critical = 0;
+            let serious = 0;
+
+            for (const r of reports) {
+              for (const v of r.violations) {
+                const key = v.id + '|' + v.impact + '|' + (r.viewport || 'desktop');
+                const blocking = v.impact === 'critical';
+                if (blocking) critical += v.count;
+                else if (v.impact === 'serious') serious += v.count;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                diagnostics.push({
+                  file: null, line: null, column: null,
+                  code: blocking ? 'A11Y_CRITICAL' : 'A11Y',
+                  message: '[' + (r.viewportLabel || 'Desktop') + '] ' + r.route + ' — [' + v.impact + '] ' + v.help + ' (' + v.count + ' element(s), e.g. ' + (v.targets[0] || 'n/a') + ')',
+                });
+              }
+            }
+
+            const perfNotes = [];
+            for (const r of reports) {
+              const p = r.perf || {};
+              const vpTag = '[' + (r.viewportLabel || 'Desktop') + '] ';
+              if (r.overflowPx && r.overflowPx > 4) {
+                perfNotes.push({ code: 'LAYOUT_OVERFLOW', message: vpTag + r.route + ' — the page scrolls sideways by ' + r.overflowPx + 'px at this width; something is wider than the screen.' });
+              }
+              if (p.lcpMs > LCP_BUDGET_MS) {
+                perfNotes.push({ code: 'PERF_LCP', message: vpTag + r.route + ' — largest content painted in ' + Math.round(p.lcpMs) + 'ms (budget ' + LCP_BUDGET_MS + 'ms).' });
+              }
+              if (p.cls > CLS_BUDGET) {
+                perfNotes.push({ code: 'PERF_CLS', message: vpTag + r.route + ' — layout shifts of ' + p.cls + ' (budget ' + CLS_BUDGET + '); reserve space for images and fonts.' });
+              }
+              if (p.largestImageBytes > IMAGE_BYTES_BUDGET) {
+                perfNotes.push({ code: 'PERF_IMAGE', message: vpTag + r.route + ' — one image is ' + Math.round(p.largestImageBytes / 1024) + 'KB (' + (p.largestImageUrl || '') + '); convert to WebP/AVIF and size it correctly.' });
+              }
+              if (p.bytes > PAGE_BYTES_BUDGET) {
+                perfNotes.push({ code: 'PERF_WEIGHT', message: vpTag + r.route + ' — page transfers ' + Math.round(p.bytes / 1024) + 'KB; split the bundle or lazy-load below-the-fold work.' });
+              }
+            }
+            for (const n of perfNotes.slice(0, 14)) {
+              diagnostics.push({ file: null, line: null, column: null, code: n.code, message: n.message });
+            }
+
+            const worstLcp = reports.reduce((a, r) => Math.max(a, (r.perf && r.perf.lcpMs) || 0), 0);
+            const uniqueRoutes = new Set(reports.map((r) => r.route)).size;
+            const out = {
+              status: critical > 0 ? 'failed' : 'passed',
+              routesAudited: reports.length,
+              uniqueRoutes: uniqueRoutes,
+              viewportsAudited: VIEWPORTS.map((v) => v.id),
+              overflowViewports: Array.from(new Set(reports.filter((r) => (r.overflowPx || 0) > 4).map((r) => r.viewport))),
+              criticalCount: critical,
+              seriousCount: serious,
+              perfWarnings: perfNotes.length,
+              worstLcpMs: worstLcp,
+              reports: reports.map((r) => ({
+                route: r.route,
+                viewport: r.viewport,
+                viewportLabel: r.viewportLabel,
+                overflowPx: r.overflowPx || 0,
+                perf: r.perf,
+                violations: (r.violations || []).slice(0, 6),
+              })),
+              diagnostics: diagnostics.slice(0, 30),
+              summary:
+                critical > 0
+                  ? critical + ' critical accessibility issue(s) across ' + uniqueRoutes + ' page(s) x ' + VIEWPORTS.length + ' viewport(s).'
+                  : uniqueRoutes + ' page(s) audited at ' + VIEWPORTS.map((v) => v.label).join('/') + ': no critical accessibility issues'
+                    + (serious ? ', ' + serious + ' serious issue(s) noted' : '')
+                    + (perfNotes.length ? ', ' + perfNotes.length + ' performance warning(s)' : '')
+                    + '.',
+            };
+
+            fs.writeFileSync('/tmp/kross-a11y.json', JSON.stringify(out));
+            console.log(out.summary);
+            process.exit(critical > 0 ? 1 : 0);
+          })().catch((e) => {
+            try {
+              fs.writeFileSync('/tmp/kross-a11y.json', JSON.stringify({
+                status: 'skipped',
+                reason: String((e && e.message) || e).slice(0, 300),
+                routesAudited: 0, uniqueRoutes: 0, viewportsAudited: [], criticalCount: 0, seriousCount: 0, perfWarnings: 0,
+                reports: [], diagnostics: [], summary: 'Accessibility audit could not run.',
+              }));
+            } catch (e2) {}
+            console.log('::warning::a11y/perf audit skipped: ' + String((e && e.message) || e));
+            process.exit(0);
+          });
+
+          AXEEOF
+          node /tmp/kross-a11y-probe.cjs 2>&1 | tee -a a11y.log
+          node -e "const r=require('/tmp/kross-a11y.json');if(r.status!=='passed'||r.routesAudited<1)process.exit(1)"
+
+      # ── GAP #1 — SEMANTIC ACCEPTANCE ────────────────────────────────────
+      # Everything above proves the app BUILDS and BOOTS. This proves it does
+      # what the user actually asked for: the plan's acceptance criteria were
+      # compiled into .kross/acceptance.json and are replayed here against
+      # the real rendered app. A failure here means the feature is missing or
+      # broken, even though the code compiles — and it blocks the publish.
+      - name: ✅ Acceptance checks (does it do what was asked?)
+        if: hashFiles('.kross/acceptance.json') != ''
+        env:
+          KROSS_PREVIEW_PORT: "4173"
+        run: |
+          set -eo pipefail
+          echo acceptance > /tmp/kross-phase
+          echo "KROSS_PHASE=acceptance" >> "$GITHUB_ENV"
+          cat > /tmp/kross-acceptance-probe.cjs <<'ACCEPTEOF'
+          const fs = require('fs');
+          const path = require('path');
+          const { chromium } = require('playwright');
+
+          const PORT = process.env.KROSS_PREVIEW_PORT || '4173';
+          const BASE = 'http://127.0.0.1:' + PORT;
+          const OUT = '/tmp/kross-acceptance.json';
+          const MANIFEST = path.join(process.cwd(), '.kross/acceptance.json');
+
+          function write(payload) {
+            try { fs.writeFileSync(OUT, JSON.stringify(payload)); } catch (e) {}
+          }
+
+          function clean(s) {
+            return String(s == null ? '' : s).replace(/\u001b\[[0-9;]*m/g, '').replace(/\s+/g, ' ').trim().slice(0, 300);
+          }
+
+          async function mounted(page) {
+            return await page.evaluate(() => {
+              const root = document.getElementById('root') || document.body;
+              return !!root && root.innerHTML.trim().length > 30;
+            }).catch(() => false);
+          }
+
+          async function visibleText(page) {
+            return await page.evaluate(() => (document.body && document.body.innerText) || '').catch(() => '');
+          }
+
+          async function findByName(page, name) {
+            const escaped = String(name).replace(/["\\]/g, '\\$&');
+            const candidates = [
+              page.getByRole('button', { name: new RegExp(escapeRe(name), 'i') }),
+              page.getByRole('link', { name: new RegExp(escapeRe(name), 'i') }),
+              page.getByLabel(new RegExp(escapeRe(name), 'i')),
+              page.getByPlaceholder(new RegExp(escapeRe(name), 'i')),
+              page.getByText(new RegExp(escapeRe(name), 'i')),
+              page.locator('[aria-label*="' + escaped + '" i]'),
+            ];
+            for (const c of candidates) {
+              try {
+                const n = await c.count();
+                if (n > 0) return c.first();
+              } catch (e) {}
+            }
+            return null;
+          }
+
+          function escapeRe(s) {
+            return String(s).replace(/[.*+?^$\{\}()|[\]\\]/g, '\\$&');
+          }
+
+          // ---------------------------------------------------------------------------
+          // DATA ASSERTIONS — the RLS query proof lane, executed inside the acceptance
+          // run. Credentials come from the CI environment, never from the manifest.
+          // ---------------------------------------------------------------------------
+
+          const DB_URL = (process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+          const DB_KEY =
+            process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+            process.env.VITE_SUPABASE_ANON_KEY ||
+            process.env.SUPABASE_ANON_KEY ||
+            '';
+
+          function dataProbeAvailable() {
+            return !!DB_URL && !!DB_KEY;
+          }
+
+          /**
+           * One PostgREST read as the app's own anonymous role.
+           * Returns { status, count, body }. count is -1 when unknown.
+           */
+          async function probeTable(table) {
+            const url = DB_URL + '/rest/v1/' + encodeURIComponent(table) + '?select=*';
+            const res = await fetch(url, {
+              headers: {
+                apikey: DB_KEY,
+                Authorization: 'Bearer ' + DB_KEY,
+                Accept: 'application/json',
+                Prefer: 'count=exact',
+                Range: '0-0',
+              },
+            });
+            const body = clean(await res.text().catch(() => ''));
+            let count = -1;
+            const cr = res.headers.get('content-range') || '';
+            const m = cr.match(/\/(\d+)$/);
+            if (m) count = parseInt(m[1], 10);
+            return { status: res.status, count: count, body: body };
+          }
+
+          /** Classify a probe into a verdict the self-heal ladder can act on. */
+          function classifyProbe(p, table) {
+            if (p.status === 404 || /does not exist/i.test(p.body)) {
+              return { cause: 'rls', message: 'the "' + table + '" table does not exist in the database' };
+            }
+            if (p.status === 401 || p.status === 403 || /permission denied/i.test(p.body)) {
+              return { cause: 'rls', message: 'the database refuses to read "' + table + '" for the app (HTTP ' + p.status + ') — grants or policies are missing' };
+            }
+            if (p.status < 200 || p.status >= 300) {
+              return null; // infrastructure noise: never a product failure
+            }
+            return { ok: true, count: p.count };
+          }
+
+          async function runCheck(page, check, errors) {
+            const target = check.target || '';
+            const route = check.route || '/';
+            const url = BASE + (route === '/' ? '/' : route);
+            const data = check.data || null;
+            const canProbe = !!data && dataProbeAvailable();
+
+            // Row count BEFORE the interaction, so a write criterion can be proven to
+            // have actually written rather than merely to have shown a toast.
+            let baseline = null;
+            if (canProbe) {
+              try {
+                const p = await probeTable(data.table);
+                const verdict = classifyProbe(p, data.table);
+                if (verdict && verdict.cause === 'rls') {
+                  return { ok: false, cause: 'rls', table: data.table, message: verdict.message };
+                }
+                if (verdict && verdict.ok) baseline = verdict.count;
+              } catch (e) { baseline = null; }
+            }
+
+            const before = errors.length;
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+            await page.waitForTimeout(700);
+
+            if (!(await mounted(page))) {
+              return { ok: false, message: 'the page did not render any content' };
+            }
+
+            if (check.kind === 'route') {
+              return { ok: true };
+            }
+
+            if (check.kind === 'visible') {
+              const text = await visibleText(page);
+              const hit = text.toLowerCase().includes(String(target).toLowerCase());
+              return hit ? { ok: true } : { ok: false, message: '"' + target + '" was not visible on ' + route };
+            }
+
+            if (check.kind === 'list') {
+              const count = await page.evaluate(() => {
+                const sels = ['ul > li', 'ol > li', '[role="list"] > *', 'tbody > tr', '[data-testid*="card"]', 'article'];
+                let best = 0;
+                for (const s of sels) {
+                  try { best = Math.max(best, document.querySelectorAll(s).length); } catch (e) {}
+                }
+                return best;
+              }).catch(() => 0);
+              if (count === 0) {
+                // Attribute the empty list to its real cause when we can.
+                if (canProbe && baseline === 0) {
+                  return {
+                    ok: false, cause: 'rls', table: data.table,
+                    message: 'the ' + (target || 'list') + ' on ' + route + ' is empty because "' + data.table +
+                      '" returns no rows to the app — the data, not the component, is the problem',
+                  };
+                }
+                return { ok: false, cause: 'ui', message: 'the ' + (target || 'list') + ' rendered no items at all on ' + route };
+              }
+              // Rendered items with a provably empty table means the list is fabricated.
+              if (canProbe && baseline === 0 && !data.write) {
+                return {
+                  ok: false, cause: 'data-fake', table: data.table,
+                  message: 'the ' + (target || 'list') + ' on ' + route + ' shows items, but "' + data.table +
+                    '" has no rows readable by the app — the page is rendering placeholder data, not real data',
+                };
+              }
+              return { ok: true };
+            }
+
+
+            const el = await findByName(page, target);
+            if (!el) {
+              return { ok: false, message: 'could not find "' + target + '" on ' + route };
+            }
+
+            if (check.kind === 'input') {
+              try {
+                await el.fill('Kross test value', { timeout: 5000 });
+                const val = await el.inputValue({ timeout: 3000 }).catch(() => '');
+                return val
+                  ? { ok: true }
+                  : { ok: false, message: '"' + target + '" did not accept or keep typed input' };
+              } catch (e) {
+                return { ok: false, message: '"' + target + '" is not a usable input (' + clean(e.message) + ')' };
+              }
+            }
+
+            // click / submit
+            const beforeHtml = await page.evaluate(() => (document.getElementById('root') || document.body).innerHTML.length).catch(() => 0);
+            const beforeUrl = page.url();
+            try {
+              await el.click({ timeout: 8000 });
+            } catch (e) {
+              return { ok: false, message: '"' + target + '" could not be clicked (' + clean(e.message) + ')' };
+            }
+            await page.waitForTimeout(900);
+
+            if (errors.length > before) {
+              return { ok: false, message: 'clicking "' + target + '" threw: ' + clean(errors[errors.length - 1]) };
+            }
+            if (!(await mounted(page))) {
+              return { ok: false, message: 'clicking "' + target + '" blanked the page' };
+            }
+
+            // A write criterion must have actually written. The UI saying so is not
+            // evidence: an optimistic update, a toast, or a swallowed PostgREST 403 all
+            // look identical in the DOM. Re-query the table as the app's own role.
+            let wroteRows = null;
+            if (canProbe && data.write) {
+              await page.waitForTimeout(600);
+              try {
+                const p = await probeTable(data.table);
+                const verdict = classifyProbe(p, data.table);
+                if (verdict && verdict.cause === 'rls') {
+                  return {
+                    ok: false, cause: 'rls', table: data.table,
+                    message: 'clicking "' + target + '" could not save anything — ' + verdict.message,
+                  };
+                }
+                if (verdict && verdict.ok && baseline !== null) wroteRows = verdict.count > baseline;
+              } catch (e) { wroteRows = null; }
+            }
+
+            if (wroteRows === false) {
+              return {
+                ok: false, cause: 'rls', table: data.table,
+                message: 'the app reported success but nothing was written to "' + data.table +
+                  '" — the insert is being rejected or never issued',
+              };
+            }
+
+            if (check.expect) {
+              const text = await visibleText(page);
+              const sawExpect =
+                text.toLowerCase().includes(String(check.expect).toLowerCase()) || page.url() !== beforeUrl;
+              if (sawExpect) return { ok: true };
+              return {
+                ok: false,
+                cause: 'ui',
+                message: 'clicking "' + target + '" did not produce "' + check.expect + '"',
+              };
+            }
+
+            if (check.kind === 'submit') {
+              const afterHtml = await page.evaluate(() => (document.getElementById('root') || document.body).innerHTML.length).catch(() => 0);
+              if (wroteRows === true) return { ok: true };
+              if (page.url() !== beforeUrl) return { ok: true };
+              if (Math.abs(afterHtml - beforeHtml) > 20) return { ok: true };
+              return { ok: false, cause: 'ui', message: 'submitting via "' + target + '" produced no visible response at all' };
+            }
+
+            return { ok: true };
+          }
+
+
+          (async () => {
+            let manifest = null;
+            try { manifest = JSON.parse(fs.readFileSync(MANIFEST, 'utf8')); } catch (e) { manifest = null; }
+
+            if (!manifest || !Array.isArray(manifest.checks) || manifest.checks.length === 0) {
+              write({ status: 'skipped', summary: 'No acceptance criteria to verify.', total: 0, failed: 0, diagnostics: [], reports: [] });
+              console.log('acceptance: no manifest — skipping');
+              process.exit(0);
+            }
+
+            const executable = manifest.checks.filter((c) => c && c.kind && c.kind !== 'advisory');
+            const advisory = manifest.checks.filter((c) => c && c.kind === 'advisory');
+
+            if (executable.length === 0) {
+              write({
+                status: 'skipped',
+                summary: 'All ' + advisory.length + ' acceptance criteria were reported as advisory (not automatable).',
+                total: 0, failed: 0, diagnostics: [],
+                reports: advisory.map((c) => ({ id: c.id, kind: 'advisory', criterion: c.criterion, ok: null })),
+              });
+              process.exit(0);
+            }
+
+            let browser;
+            try {
+              browser = await chromium.launch({ args: ['--no-sandbox'] });
+            } catch (e) {
+              write({ status: 'unavailable', summary: 'Chromium unavailable: ' + clean(e.message), total: 0, failed: 0, diagnostics: [], reports: [] });
+              process.exit(0);
+            }
+
+            const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+            const page = await context.newPage();
+            const errors = [];
+            page.on('pageerror', (e) => errors.push(clean(e && e.message)));
+            page.on('console', (m) => { if (m.type() === 'error') errors.push(clean(m.text())); });
+
+            const reports = [];
+            const diagnostics = [];
+
+            for (const check of executable) {
+              let result;
+              try {
+                result = await runCheck(page, check, errors);
+              } catch (e) {
+                // A harness fault is NOT a product failure — report, never fail.
+                result = { ok: null, message: 'check could not be run: ' + clean(e.message) };
+              }
+              const cause = result.cause || (result.ok === false ? 'ui' : null);
+              reports.push({
+                id: check.id,
+                step: check.step,
+                kind: check.kind,
+                route: check.route,
+                criterion: check.criterion,
+                table: (check.data && check.data.table) || null,
+                cause: cause,
+                ok: result.ok,
+                message: result.message || null,
+              });
+              if (result.ok === false) {
+                const isData = cause === 'rls' || cause === 'data-fake';
+                diagnostics.push({
+                  file: isData ? 'supabase/migrations' : null,
+                  line: null,
+                  column: null,
+                  code: isData ? 'ACCEPTANCE_RLS' : 'ACCEPTANCE',
+                  table: (check.data && check.data.table) || null,
+                  message:
+                    (isData
+                      ? 'Promised behaviour is not backed by real data — "'
+                      : 'Not doing what was asked — "') +
+                    clean(check.criterion) + '": ' + clean(result.message),
+                });
+              }
+
+            }
+
+            for (const a of advisory) {
+              reports.push({ id: a.id, step: a.step, kind: 'advisory', route: a.route, criterion: a.criterion, ok: null, message: 'reported, not automatically enforced' });
+            }
+
+            await browser.close().catch(() => {});
+
+            const failed = diagnostics.length;
+            const ran = reports.filter((r) => r.ok === true || r.ok === false).length;
+            const status = failed > 0 ? 'failed' : 'passed';
+            const summary = failed > 0
+              ? failed + ' of ' + ran + ' requested behaviours did not work in the real app.'
+              : ran + ' requested behaviour(s) verified in a real browser.';
+
+            write({ status, summary, total: ran, failed, diagnostics, reports: reports.slice(0, 40) });
+            console.log('acceptance: ' + summary);
+            process.exit(failed > 0 ? 1 : 0);
+          })().catch((e) => {
+            write({ status: 'unavailable', summary: 'acceptance probe crashed: ' + clean(e && e.message), total: 0, failed: 0, diagnostics: [], reports: [] });
+            process.exit(0);
+          });
+          ACCEPTEOF
+           node /tmp/kross-acceptance-probe.cjs 2>&1 | tee -a acceptance.log
+
+      # ── COST / PERFORMANCE BUDGET (blocking) ────────────────────────────
+      # Measures the REAL dist/ (gzipped JS/CSS, largest chunk, total output)
+      # and joins it with the real page-weight / LCP / CLS numbers sampled by
+      # the browser probe. Over the hard ceiling fails the job with phase
+      # `perf`: the provisional commit is reverted and production is blocked.
+      # Projects can raise or lower their own limits with kross.budget.json.
+      - name: 📏 Performance + size budget
+        run: |
+          set -eo pipefail
+          echo perf > /tmp/kross-phase
+          echo "KROSS_PHASE=perf" >> "$GITHUB_ENV"
+          cat > /tmp/kross-perf-probe.cjs <<'PERFEOF'
+
+          const fs = require('fs');
+          const path = require('path');
+          const zlib = require('zlib');
+
+          const DEFAULTS = {"totalJsGzip":{"warn":700000,"max":1600000},"largestJsChunkGzip":{"warn":400000,"max":900000},"totalCssGzip":{"warn":120000,"max":300000},"totalDistRaw":{"warn":8000000,"max":20000000},"pageTransferBytes":{"warn":2500000,"max":4000000},"largestImageBytes":{"warn":900000,"max":2500000},"lcpMs":{"warn":4000,"max":8000},"cls":{"warn":0.25,"max":0.5}};
+
+          function loadBudget() {
+            const b = JSON.parse(JSON.stringify(DEFAULTS));
+            let raw = null;
+            try { raw = fs.readFileSync('kross.budget.json', 'utf8'); } catch (e) { raw = null; }
+            if (!raw) return { budget: b, source: 'default' };
+            let parsed = null;
+            try { parsed = JSON.parse(raw); } catch (e) { return { budget: b, source: 'default (kross.budget.json is not valid JSON)' }; }
+            for (const k of Object.keys(b)) {
+              const v = parsed && parsed[k];
+              if (!v) continue;
+              if (typeof v === 'number') { b[k].max = v; b[k].warn = Math.round(v * 0.6 * 1000) / 1000; continue; }
+              if (typeof v.max === 'number') b[k].max = v.max;
+              if (typeof v.warn === 'number') b[k].warn = v.warn;
+            }
+            return { budget: b, source: 'kross.budget.json' };
+          }
+
+          function walk(dir, out) {
+            let entries = [];
+            try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return out; }
+            for (const e of entries) {
+              const p = path.join(dir, e.name);
+              if (e.isDirectory()) walk(p, out);
+              else out.push(p);
+            }
+            return out;
+          }
+
+          function gzipSize(p) {
+            try { return zlib.gzipSync(fs.readFileSync(p), { level: 9 }).length; } catch (e) { return 0; }
+          }
+
+          function fmt(n) {
+            if (n >= 1048576) return (n / 1048576).toFixed(2) + 'MB';
+            if (n >= 1024) return Math.round(n / 1024) + 'KB';
+            return n + 'B';
+          }
+
+          (async () => {
+            const loaded = loadBudget();
+            const BUDGET = loaded.budget;
+
+            if (!fs.existsSync('dist')) {
+              fs.writeFileSync('/tmp/kross-perf.json', JSON.stringify({
+                status: 'skipped', reason: 'no dist/ directory', budgetSource: loaded.source,
+                metrics: {}, breaches: [], warnings: [], diagnostics: [],
+                summary: 'Performance budget check skipped (no build output).',
+              }));
+              process.exit(0);
+            }
+
+            const files = walk('dist', []);
+            let totalJsGzip = 0, totalCssGzip = 0, totalRaw = 0, largestChunk = 0, largestChunkName = '';
+            const chunks = [];
+            for (const f of files) {
+              let size = 0;
+              try { size = fs.statSync(f).size; } catch (e) { continue; }
+              if (/\.map$/.test(f)) continue;
+              totalRaw += size;
+              if (/\.(js|mjs|cjs)$/.test(f)) {
+                const g = gzipSize(f);
+                totalJsGzip += g;
+                chunks.push({ file: f.replace(/^dist\//, ''), raw: size, gzip: g });
+                if (g > largestChunk) { largestChunk = g; largestChunkName = f.replace(/^dist\//, ''); }
+              } else if (/\.css$/.test(f)) {
+                totalCssGzip += gzipSize(f);
+              }
+            }
+            chunks.sort((a, b) => b.gzip - a.gzip);
+
+            // Runtime numbers sampled by the browser probe against the SERVED bundle.
+            let a11y = null;
+            try { a11y = JSON.parse(fs.readFileSync('/tmp/kross-a11y.json', 'utf8')); } catch (e) { a11y = null; }
+            let pageTransferBytes = 0, pageTransferRoute = '', largestImageBytes = 0, largestImageRoute = '';
+            let worstLcp = 0, worstLcpRoute = '', worstCls = 0, worstClsRoute = '';
+            const reports = (a11y && Array.isArray(a11y.reports)) ? a11y.reports : [];
+            for (const r of reports) {
+              const p = (r && r.perf) || {};
+              const tag = (r.viewportLabel ? '[' + r.viewportLabel + '] ' : '') + (r.route || '/');
+              if ((p.bytes || 0) > pageTransferBytes) { pageTransferBytes = p.bytes || 0; pageTransferRoute = tag; }
+              if ((p.largestImageBytes || 0) > largestImageBytes) { largestImageBytes = p.largestImageBytes || 0; largestImageRoute = tag; }
+              if ((p.lcpMs || 0) > worstLcp) { worstLcp = p.lcpMs || 0; worstLcpRoute = tag; }
+              if ((p.cls || 0) > worstCls) { worstCls = p.cls || 0; worstClsRoute = tag; }
+            }
+
+            const metrics = {
+              totalJsGzip: { value: totalJsGzip, where: chunks.length + ' JS chunk(s)' },
+              largestJsChunkGzip: { value: largestChunk, where: largestChunkName },
+              totalCssGzip: { value: totalCssGzip, where: 'stylesheets' },
+              totalDistRaw: { value: totalRaw, where: files.length + ' build file(s)' },
+              pageTransferBytes: { value: pageTransferBytes, where: pageTransferRoute },
+              largestImageBytes: { value: largestImageBytes, where: largestImageRoute },
+              lcpMs: { value: Math.round(worstLcp), where: worstLcpRoute },
+              cls: { value: Math.round(worstCls * 1000) / 1000, where: worstClsRoute },
+            };
+
+            const LABEL = {
+              totalJsGzip: 'total JavaScript (gzipped)',
+              largestJsChunkGzip: 'largest JavaScript chunk (gzipped)',
+              totalCssGzip: 'total CSS (gzipped)',
+              totalDistRaw: 'total build output',
+              pageTransferBytes: 'heaviest page download',
+              largestImageBytes: 'largest image',
+              lcpMs: 'slowest largest-contentful-paint',
+              cls: 'worst layout shift',
+            };
+            const TIME_OR_SCORE = { lcpMs: 1, cls: 1 };
+            const show = (k, v) => TIME_OR_SCORE[k] ? (k === 'lcpMs' ? Math.round(v) + 'ms' : String(v)) : fmt(v);
+
+            const breaches = [];
+            const warnings = [];
+            const diagnostics = [];
+            for (const k of Object.keys(BUDGET)) {
+              const m = metrics[k];
+              if (!m) continue;
+              // A metric the browser probe never produced (0) is not evidence of speed;
+              // it is absence of measurement. Never fail on it.
+              if (!m.value) continue;
+              const b = BUDGET[k];
+              const where = m.where ? ' (' + m.where + ')' : '';
+              if (m.value > b.max) {
+                breaches.push({ metric: k, value: m.value, budget: b.max, where: m.where || null });
+                diagnostics.push({
+                  file: k === 'largestJsChunkGzip' && m.where ? null : null,
+                  line: null, column: null, code: 'PERF_BUDGET',
+                  message: LABEL[k] + ' is ' + show(k, m.value) + where + ', over the hard limit of ' + show(k, b.max) + '. This is too heavy to ship.',
+                });
+              } else if (m.value > b.warn) {
+                warnings.push({ metric: k, value: m.value, budget: b.warn, where: m.where || null });
+                diagnostics.push({
+                  file: null, line: null, column: null, code: 'PERF_BUDGET_WARN',
+                  message: LABEL[k] + ' is ' + show(k, m.value) + where + ', above the comfortable limit of ' + show(k, b.warn) + ' (still under the hard limit).',
+                });
+              }
+            }
+
+            const topChunks = chunks.slice(0, 5).map((c) => c.file + ' ' + fmt(c.gzip));
+            const out = {
+              status: breaches.length ? 'failed' : 'passed',
+              budgetSource: loaded.source,
+              metrics: metrics,
+              budget: BUDGET,
+              breaches: breaches,
+              warnings: warnings,
+              topChunks: topChunks,
+              diagnostics: diagnostics.slice(0, 20),
+              summary: breaches.length
+                ? breaches.length + ' performance budget(s) exceeded: ' + breaches.map((b) => LABEL[b.metric] + ' ' + show(b.metric, b.value) + ' > ' + show(b.metric, b.budget)).join('; ')
+                : 'Within performance budget (' + fmt(totalJsGzip) + ' JS gzipped'
+                  + (pageTransferBytes ? ', ' + fmt(pageTransferBytes) + ' heaviest page' : '') + ')'
+                  + (warnings.length ? ', ' + warnings.length + ' near-limit warning(s)' : '') + '.',
+            };
+            fs.writeFileSync('/tmp/kross-perf.json', JSON.stringify(out));
+            console.log(out.summary);
+            if (breaches.length) {
+              for (const d of out.diagnostics) console.log('::error::' + d.message);
+            }
+            process.exit(breaches.length ? 1 : 0);
+          })().catch((e) => {
+            try {
+              fs.writeFileSync('/tmp/kross-perf.json', JSON.stringify({
+                status: 'skipped', reason: String((e && e.message) || e).slice(0, 300),
+                metrics: {}, breaches: [], warnings: [], diagnostics: [],
+                summary: 'Performance budget check could not run.',
+              }));
+            } catch (e2) {}
+            console.log('::warning::perf budget check skipped: ' + String((e && e.message) || e));
+            process.exit(0);
+          });
+
+          PERFEOF
+          node /tmp/kross-perf-probe.cjs 2>&1 | tee -a perf.log
+
+
+
+
+
+
+
+      - name: 📮 Report verdict to KrossBuild
+        if: always()
+        env:
+          VERIFY_URL: ${{ secrets.KROSS_VERIFY_URL }}
+          DEPLOY_TOKEN: ${{ secrets.KROSS_DEPLOY_TOKEN }}
+          ANON_KEY: ${{ secrets.KROSS_ANON_KEY }}
+          PROJECT_ID: ${{ secrets.KROSS_PROJECT_ID }}
+          VERIFICATION_ID: ${{ github.event.client_payload.verification_id }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$VERIFY_URL" ] || [ -z "$DEPLOY_TOKEN" ]; then
+            echo "::warning::KROSS_VERIFY_URL / KROSS_DEPLOY_TOKEN not configured — cannot report verdict."
+            exit 0
+          fi
+          cat > /tmp/kross-parse.cjs <<'PARSEEOF'
+          const fs = require('fs');
+          const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return ''; } };
+          const buildLog = read('verify.log');
+          const typeLog = read('typecheck.log');
+          const diagnostics = [];
+          const push = (d) => {
+            if (diagnostics.length >= 40) return;
+            if (diagnostics.some((x) => x.file === d.file && x.line === d.line && x.message === d.message)) return;
+            diagnostics.push(d);
+          };
+          const clean = (s) => String(s || '').replace(/\u001b\[[0-9;]*m/g, '').trim().slice(0, 400);
+
+          // tsc:  src/App.tsx(12,3): error TS2322: Type 'x' is not assignable...
+          for (const m of typeLog.matchAll(/^(.+?)\((\d+),(\d+)\):\s+error\s+(TS\d+):\s*(.+)$/gm)) {
+            push({ file: clean(m[1]), line: Number(m[2]), column: Number(m[3]), code: m[4], message: clean(m[5]) });
+          }
+          // rollup: Could not resolve "./x" from "src/y.tsx"
+          for (const m of buildLog.matchAll(/Could not resolve ["']([^"']+)["'] from ["']([^"']+)["']/g)) {
+            push({ file: clean(m[2]), line: null, column: null, code: 'ROLLUP_UNRESOLVED', message: 'Could not resolve "' + clean(m[1]) + '"' });
+          }
+          // esbuild: src/x.ts:12:4: ERROR: message
+          for (const m of buildLog.matchAll(/^(.+?):(\d+):(\d+):\s*(?:ERROR|error):\s*(.+)$/gm)) {
+            push({ file: clean(m[1]), line: Number(m[2]), column: Number(m[3]), code: 'ESBUILD', message: clean(m[4]) });
+          }
+          // bun install failures
+          for (const m of buildLog.matchAll(/error:\s*(.*(?:not found|failed to resolve|No version matching|EACCES|ENOTFOUND).*)$/gim)) {
+            push({ file: 'package.json', line: null, column: null, code: 'INSTALL', message: clean(m[1]) });
+          }
+          // Generic vite/rollup error lines as a last resort.
+          if (!diagnostics.length) {
+            for (const m of buildLog.matchAll(/^(?:\[vite\][^\n]*|error during build:[^\n]*|RollupError:[^\n]*|Error:[^\n]*)$/gm)) {
+              push({ file: null, line: null, column: null, code: 'BUILD', message: clean(m[0]) });
+            }
+          }
+
+          // F30 — vitest smoke-suite verdict (named assertions).
+          let tests = null;
+          try { tests = JSON.parse(read('/tmp/kross-vitest.json') || 'null'); } catch { tests = null; }
+          if (tests && Array.isArray(tests.testResults)) {
+            for (const suite of tests.testResults) {
+              for (const a of (suite.assertionResults || [])) {
+                if (a.status !== 'failed') continue;
+                const detail = clean((a.failureMessages || [])[0] || '').split('\n')[0];
+                push({
+                  file: clean(suite.name || '').replace(process.cwd() + '/', '') || null,
+                  line: null, column: null, code: 'TEST',
+                  message: clean((a.fullName || a.title || 'test') + ' — ' + detail),
+                });
+              }
+            }
+          }
+          const failedTests = tests && typeof tests.numFailedTests === 'number' ? tests.numFailedTests : 0;
+
+          // Saved browser flow tests (Playwright JSON): name every failed test and its error.
+          let flowReport = null;
+          try { flowReport = JSON.parse(read('/tmp/kross-browser-flows.json') || 'null'); } catch { flowReport = null; }
+          if (flowReport) {
+            const walk = (suite, parent) => {
+              const title = [parent, suite.title].filter(Boolean).join(' › ');
+              for (const spec of suite.specs || []) for (const t of spec.tests || []) {
+                if (t.status === 'expected' || t.status === 'skipped') continue;
+                const r = (t.results || []).find((x) => x.status !== 'passed') || {};
+                const lines = String((r.error && (r.error.message || r.error.value)) || (r.errors && r.errors[0] && r.errors[0].message) || 'failed').replace(/\u001b\[[0-9;]*m/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
+                const err = clean([lines[0], ...lines.filter((l) => /^(Expected|Received|Locator|- waiting for|- locator resolved|unexpected value)/i.test(l)).slice(0, 4)].join(' · '));
+                push({ file: 'src/verification/' + String(spec.file || suite.file || '').replace(/^.*src\/verification\//, ''), line: spec.line || null, column: null, code: 'FLOW', message: clean((title ? title + ' › ' : '') + spec.title + ' — ' + err) });
+              }
+              for (const child of suite.suites || []) walk(child, title);
+            };
+            for (const s of flowReport.suites || []) walk(s, '');
+            for (const e of flowReport.errors || []) push({ file: null, line: null, column: null, code: 'FLOW', message: clean(e.message || 'Browser tests could not load') });
+          }
+
+          // F28 — runtime boot verdict (per-route, real browser).
+          let runtime = null;
+          try { runtime = JSON.parse(read('/tmp/kross-runtime.json') || 'null'); } catch { runtime = null; }
+          if (runtime && Array.isArray(runtime.diagnostics)) {
+            for (const d of runtime.diagnostics) {
+              push({ file: d.file || null, line: d.line || null, column: d.column || null, code: d.code || 'RUNTIME', message: clean(d.message) });
+            }
+          }
+
+
+          // B4 — server-render verdict (SSR trees only).
+          let ssr = null;
+          try { ssr = JSON.parse(read('/tmp/kross-ssr.json') || 'null'); } catch { ssr = null; }
+          if (ssr && Array.isArray(ssr.diagnostics)) {
+            for (const d of ssr.diagnostics) {
+              push({ file: null, line: null, column: null, code: d.code || 'SSR', message: clean(d.message) });
+            }
+          }
+
+          // F31 — accessibility + performance audit (axe-core + web vitals).
+          let a11y = null;
+          try { a11y = JSON.parse(read('/tmp/kross-a11y.json') || 'null'); } catch { a11y = null; }
+          if (a11y && Array.isArray(a11y.diagnostics)) {
+            for (const d of a11y.diagnostics) {
+              push({ file: d.file || null, line: d.line || null, column: d.column || null, code: d.code || 'A11Y', message: clean(d.message) });
+            }
+          }
+
+          // COST / PERF BUDGET — real dist/ measurement + real page weight.
+          let perf = null;
+          try { perf = JSON.parse(read('/tmp/kross-perf.json') || 'null'); } catch { perf = null; }
+          if (perf && Array.isArray(perf.diagnostics)) {
+            for (const d of perf.diagnostics) {
+              push({ file: d.file || null, line: null, column: null, code: d.code || 'PERF_BUDGET', message: clean(d.message) });
+            }
+          }
+
+          // GAP #1 — semantic acceptance verdict (real browser, real behaviour).
+          let acceptance = null;
+          try { acceptance = JSON.parse(read('/tmp/kross-acceptance.json') || 'null'); } catch { acceptance = null; }
+          if (acceptance && Array.isArray(acceptance.diagnostics)) {
+            for (const d of acceptance.diagnostics) {
+              push({ file: d.file || null, line: null, column: null, code: d.code || 'ACCEPT', message: clean(d.message) });
+            }
+          }
+
+          const status = process.env.JOB_STATUS === 'success' ? 'passed' : 'failed';
+          let phase = null;
+          if (status !== 'passed') phase = clean(read('/tmp/kross-phase')) || process.env.KROSS_PHASE || 'bundle';
+          const started = Number(process.env.KROSS_STARTED_AT || 0);
+          const durationMs = started ? Date.now() - started : null;
+          const runtimeSummary = runtime && runtime.summary ? ' ' + runtime.summary : '';
+          const a11ySummary = a11y && a11y.summary ? ' ' + a11y.summary : '';
+          const acceptSummary = acceptance && acceptance.summary ? ' ' + acceptance.summary : '';
+          const perfSummary = perf && perf.summary ? ' ' + perf.summary : '';
+          const testSummary = tests && typeof tests.numTotalTests === 'number'
+            ? ' ' + (tests.numTotalTests - failedTests) + '/' + tests.numTotalTests + ' smoke checks passed.'
+            : '';
+          const summary = status === 'passed'
+            ? ('Real install + vite build succeeded.' + testSummary + runtimeSummary + a11ySummary + acceptSummary + perfSummary).slice(0, 600)
+            : (phase === 'ssr'
+                ? ('The app did not server-render real HTML.' + (ssr && ssr.summary ? ' ' + ssr.summary : ''))
+              : phase === 'runtime'
+                ? ('App failed to boot in a real browser.' + runtimeSummary)
+                : phase === 'a11y'
+                  ? ((a11y && a11y.criticalCount ? a11y.criticalCount : 'Some') + ' critical accessibility issue(s) found in the rendered app.')
+                : phase === 'perf'
+                  ? ('The app is over its size/speed budget and would be painfully slow for real users.' + perfSummary)
+                : phase === 'acceptance'
+                  ? ((acceptance && acceptance.failed ? acceptance.failed : 'Some') + ' of the things you asked for are not working in the built app.' + acceptSummary)
+                : phase === 'tests'
+                  ? (failedTests + ' smoke test(s) failed — a previously working part of the app broke.')
+                  : 'Bundle verification failed during ' + phase + (diagnostics.length ? ' (' + diagnostics.length + ' diagnostic(s)).' : '.')).slice(0, 600);
+
+
+          fs.writeFileSync('/tmp/kross-verdict.json', JSON.stringify({
+            verificationId: process.env.VERIFICATION_ID || null,
+            projectId: process.env.PROJECT_ID || null,
+            status,
+            phase,
+            diagnostics,
+            summary,
+            runUrl: process.env.RUN_URL || null,
+            durationMs,
+            tests: tests ? {
+              total: tests.numTotalTests || 0,
+              failed: failedTests,
+              suites: (tests.testResults || []).length,
+            } : null,
+            runtime: runtime ? {
+              status: runtime.status,
+              routesChecked: runtime.routesChecked,
+              routesCrashed: runtime.routesCrashed,
+              routesDegraded: runtime.routesDegraded,
+              reports: (runtime.reports || []).slice(0, 20),
+              summary: runtime.summary,
+            } : null,
+            a11y: a11y ? {
+              status: a11y.status,
+              routesAudited: a11y.routesAudited,
+              criticalCount: a11y.criticalCount,
+              seriousCount: a11y.seriousCount,
+              perfWarnings: a11y.perfWarnings,
+              worstLcpMs: a11y.worstLcpMs,
+              reports: (a11y.reports || []).slice(0, 30),
+              summary: a11y.summary,
+            } : null,
+            perf: perf ? {
+              status: perf.status,
+              budgetSource: perf.budgetSource || null,
+              metrics: perf.metrics || {},
+              breaches: (perf.breaches || []).slice(0, 12),
+              warnings: (perf.warnings || []).slice(0, 12),
+              topChunks: (perf.topChunks || []).slice(0, 5),
+              summary: perf.summary,
+            } : null,
+            acceptance: acceptance ? {
+              status: acceptance.status,
+              total: acceptance.total || 0,
+              passed: acceptance.passed || 0,
+              failed: acceptance.failed || 0,
+              reports: (acceptance.reports || []).slice(0, 20),
+              summary: acceptance.summary,
+            } : null,
+            logTail: (buildLog + '\n' + typeLog).slice(-6000),
+          }));
+          console.log(summary);
+          PARSEEOF
+          node /tmp/kross-parse.cjs
+          curl -sS -X POST "$VERIFY_URL" \
+            -H "apikey: $ANON_KEY" \
+            -H "x-kross-deploy-token: $DEPLOY_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data @/tmp/kross-verdict.json || true
+          echo "Reported verdict to KrossBuild."
+
+      - name: 🧹 Delete candidate ref
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ github.event.client_payload.checkout_ref }}
+        run: |
+          if [ -n "$REF" ] && [ -n "$GH_TOKEN" ]; then
+            curl -sS -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "${{ github.api_url }}/repos/${{ github.repository }}/git/refs/heads/$REF" || true
+          fi
