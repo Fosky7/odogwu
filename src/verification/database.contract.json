@@ -1,0 +1,19 @@
+{
+  "tables": [
+    {
+      "table": "bill_requests",
+      "ownerColumn": "owner_id",
+      "keyColumns": ["owner_id", "source_collection", "source_id"],
+      "fixtures": {
+        "source_collection": "bill_requests_v1",
+        "source_id": "e2e-adoption-fixture",
+        "title": "E2E adoption fixture",
+        "amount_owed": 18500,
+        "description": "Disposable record created by verification",
+        "proof_file_name": "bill-proof.png",
+        "status": "pending",
+        "submitted_at": "2024-05-01T10:00:00.000Z"
+      }
+    }
+  ]
+}
