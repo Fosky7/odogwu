@@ -145,7 +145,7 @@ export function SwipeDeck({ bills, footer, causeId = DEFAULT_CAUSE_ID }: SwipeDe
               the full story and the proof behind the amount before pledging. */}
           <Link
             to="/cause/$id"
-            params={{ id: causeId }}
+            params={{ id: bill?.id ?? causeId }}
             className="mt-4 inline-flex items-center gap-1 text-sm font-semibold text-primary underline-offset-4 hover:underline"
           >
             View bill details <ChevronRight className="h-4 w-4" aria-hidden="true" />

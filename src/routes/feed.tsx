@@ -143,7 +143,7 @@ function FeedPage() {
 
             <Link
               to="/cause/$id"
-              params={{ id: PLEDGE_CAUSE_ID }}
+              params={{ id: bill.id }}
               className="mt-4 inline-flex items-center gap-1 text-sm font-semibold text-emerald-700 hover:underline"
             >
               View bill details <ChevronRight className="h-4 w-4" aria-hidden="true" />

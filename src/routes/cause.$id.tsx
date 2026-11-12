@@ -52,9 +52,12 @@ function formatNaira(value: number): string {
 function CauseDetailPage() {
   const { id } = Route.useParams();
 
-  const bill = bills.find(
-    (candidate) => pick(candidate, ["id", "causeId", "slug"], "") === String(id),
-  );
+  // Older links used a 1-based number (e.g. /cause/1); map those to the
+  // matching bill in the shared list so they never land on "not found".
+  const bill =
+    bills.find(
+      (candidate) => pick(candidate, ["id", "causeId", "slug"], "") === String(id),
+    ) ?? (/^[1-9]\d*$/.test(String(id)) ? bills[Number(id) - 1] : undefined);
 
   if (!bill) {
     return (

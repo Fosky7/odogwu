@@ -286,7 +286,7 @@ function HomePage() {
 
                 <Link
                   to="/cause/$id"
-                  params={{ id: "1" }}
+                  params={{ id: featured.id }}
                   data-testid="featured-cause-link"
                   className="mt-6 inline-flex items-center gap-1.5 text-sm font-semibold text-primary underline-offset-4 transition hover:underline"
                 >
