@@ -1,5 +1,5 @@
 name: Kross Verify
-# KrossBuild bundle-verification lane v18-pass-with-no-tests
+# KrossBuild bundle-verification lane v20-page-contracts-and-live-checks
 #
 # Proves that a candidate tree really installs, typechecks and bundles BEFORE
 # KrossBuild publishes it. Never deploys anything.
@@ -217,7 +217,41 @@ jobs:
           const { chromium } = require('playwright');
 
           const BASE = 'http://127.0.0.1:' + (process.env.KROSS_PREVIEW_PORT || '4173');
-          const MAX_ROUTES = 14;
+          const webRouteInventory = function webRouteInventory(files) {
+            const out = [];
+            for (const f of files){
+              const m = f.path.replaceAll('\\', '/').match(/^src\/routes\/(.+)\.[jt]sx?$/);
+              if (!m || /(^|[/.])(?:api|__root|-[^/.]*)($|[/.])/.test(m[1]) || m[1].includes('$')) continue;
+              const literal = /createFileRoute\(\s*['"]([^'"]+)['"]\s*\)/.exec(f.content)?.[1];
+              const parts = (literal || m[1]).replace(/\[([^\]]+)\]/g, '$1').split(/[/.]/).filter(Boolean).filter((p)=>!p.startsWith('_')).map((p)=>p.replace(/_$/, ''));
+              if (parts[parts.length - 1] === 'index') parts.pop();
+              if (/^\/_/.test(literal || '') && /<Outlet\s*\/?\s*>/.test(f.content)) continue;
+              if (!literal && /<Outlet\s*\/?\s*>/.test(f.content)) continue;
+              out.push({
+                path: f.path,
+                address: '/' + parts.join('/')
+              });
+            }
+            return out;
+          };
+          const headProblems = function headProblems(head, earlier) {
+            const problems = [];
+            for (const key of [
+              'title',
+              'description',
+              'ogTitle',
+              'ogDescription',
+              'ogType',
+              'twitterCard'
+            ]){
+              if (!head[key]?.trim()) problems.push('missing ' + key);
+              if ((head.counts?.[key] || 0) > 1) problems.push('duplicate ' + key + ' tags');
+            }
+            if (/Lovable (?:App|Generated Project)/i.test(head.title)) problems.push('platform placeholder title');
+            if (earlier.some((h)=>h.title === head.title && head.title)) problems.push('title reused on another content page');
+            if (earlier.some((h)=>h.description === head.description && head.description)) problems.push('description reused on another content page');
+            return problems;
+          };
           const PER_ROUTE_MS = 12000;
           const MAX_LINKS = 40;
 
@@ -277,7 +311,8 @@ jobs:
                 }
               }
             }
-            return Array.from(found).slice(0, MAX_ROUTES);
+            const canonical = webRouteInventory(files.map(f => ({path:f,content:fs.readFileSync(f,'utf8')})));
+            return canonical.length ? Array.from(new Set(canonical.map(r => r.address))) : Array.from(found);
           }
 
           const NOISE = [
@@ -299,6 +334,8 @@ jobs:
               failedRequests: [],
               rootText: 0,
               links: [],
+              body: '',
+              buttons: [],
             };
             const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
             const page = await context.newPage();
@@ -350,12 +387,25 @@ jobs:
             try {
               const info = await page.evaluate(() => {
                 const root = document.getElementById('root') || document.body;
+                const txt = root && root.innerText ? root.innerText : '';
                 return {
-                  text: (root && root.innerText ? root.innerText : '').trim().length,
+                  text: txt.trim().length,
                   nodes: root ? root.querySelectorAll('*').length : 0,
+                  body: txt.slice(0, 4000),
+                  buttons: Array.from(document.querySelectorAll('button, [role="button"], a[href]')).slice(0, 80)
+                    .map((el) => ((el.innerText || el.getAttribute('aria-label') || '')).trim().slice(0, 60)),
                 };
               });
               report.rootText = info.text;
+              report.body = info.body || '';
+              report.buttons = info.buttons || [];
+              report.finalPath = new URL(page.url()).pathname;
+              report.head = await page.evaluate(() => {
+                const selectors = {description:'meta[name="description"]',ogTitle:'meta[property="og:title"]',ogDescription:'meta[property="og:description"]',ogType:'meta[property="og:type"]',twitterCard:'meta[name="twitter:card"]'};
+                const h = {title:document.title,counts:{title:document.querySelectorAll('title').length}};
+                for (const key in selectors) { h[key] = document.querySelector(selectors[key])?.content || ''; h.counts[key] = document.querySelectorAll(selectors[key]).length; }
+                return h;
+              });
               if (report.status !== 'crashed' && info.text < 8 && info.nodes < 6) {
                 report.status = 'crashed';
                 report.pageErrors.push({ message: 'Route mounted nothing: #root rendered no visible content.', stack: '' });
@@ -365,7 +415,11 @@ jobs:
               report.pageErrors.push({ message: 'DOM inspection failed: ' + String((e && e.message) || e).slice(0, 200), stack: '' });
             }
 
-            if (report.status !== 'crashed' && report.pageErrors.length > 0) report.status = 'crashed';
+            const actionable = report.consoleErrors.filter(e => !/Failed to load resource:.*(?:401|403|404|429)|Unauthorized|not authenticated|sign.?in required/i.test(e));
+            if (report.status !== 'crashed' && (report.pageErrors.length || actionable.length)) {
+              report.status = 'crashed';
+              for (const e of actionable) report.pageErrors.push({message:'Console error: ' + e,stack:''});
+            }
             if (report.status === 'mounted' && (report.consoleErrors.length > 0 || report.failedRequests.length > 0)) {
               report.status = 'degraded';
             }
@@ -418,6 +472,120 @@ jobs:
             return dead;
           }
 
+          /** A visitor-facing screen that shows a technical failure instead of a message. */
+          const RAW_STRONG_RE = /(minified react error|cannot get [/]|internal server error|Traceback \(most recent call last\)|unexpected end of (json|input))/i;
+          const RAW_ERROR_RE = /(minified react error|cannot get [/]|internal server error|Traceback \(most recent call last\)|unexpected end of (json|input)|TypeError:|ReferenceError:|SyntaxError:|Uncaught |is not a function|cannot read propert|stack trace)/i;
+
+          function rawErrorScreen(text) {
+            const t = String(text || '').trim();
+            if (!t) return null;
+            const strong = RAW_STRONG_RE.test(t);
+            if (!strong && t.length > 900) return null;
+            if (!RAW_ERROR_RE.test(t)) return null;
+            const i = t.search(RAW_ERROR_RE);
+            return t.slice(Math.max(0, i - 40), i + 140).replace(/\s+/g, ' ').slice(0, 180);
+          }
+
+          /** Visible money amounts, keyed by how each one is written. */
+          const AMOUNT_RE = /(?:[\u20a6$\u20ac\u00a3]|NGN|naira|USD|dollar|EUR|euro|GBP|pound)\s?\d[\d,]*(?:\.\d{1,2})?|\d[\d,]*(?:\.\d{1,2})?\s?(?:NGN|naira|dollars?|euros?|pounds?)/gi;
+
+          function moneyKeys(text) {
+            const keys = {};
+            const matches = String(text || '').match(AMOUNT_RE) || [];
+            for (const raw of matches) {
+              const tok = String(raw).trim();
+              if (!/\d/.test(tok)) continue;
+              const cur = /[\u20a6]|NGN|naira/i.test(tok) ? 'NGN'
+                : /[$]|USD|dollar/i.test(tok) ? 'USD'
+                : /[\u20ac]|EUR|euro/i.test(tok) ? 'EUR'
+                : /[\u00a3]|GBP|pound/i.test(tok) ? 'GBP' : null;
+              if (!cur) continue;
+              const shape = cur + '|' + (/^[^\d]/.test(tok) ? 'before' : 'after') + '|' + (/NGN|USD|EUR|GBP/i.test(tok) ? 'code' : 'symbol')
+                + '|' + (/\.\d{1,2}/.test(tok) ? 'decimals' : 'whole') + '|' + (/\d,\d{3}/.test(tok) ? 'grouped' : 'flat');
+              if (!keys[cur]) keys[cur] = {};
+              if (!keys[cur][shape]) keys[cur][shape] = tok;
+            }
+            return keys;
+          }
+
+          /** A control that should start a payment. */
+          const PAY_TEXT_SRC = '(pay now|checkout|complete (donation|payment|order|purchase)|donate now|buy now|proceed to (pay|checkout)|continue to pay|send donation|fund this bill|contribute now)';
+          const PAY_HOST_RE = /(stripe\.com|paystack|flutterwave|monnify|sslcommerz|paypal\.com|razorpay|squareup|coinbase|transact\.net|checkout\.com)/i;
+
+          /**
+           * Click the app's own pay/checkout control and prove a payment step is really
+           * reached, then come back and prove the page is still there. Requests to real
+           * payment providers are blocked, so a check can never charge anyone.
+           */
+          async function probeCheckout(browser, reports) {
+            const re = new RegExp(PAY_TEXT_SRC, 'i');
+            const pages = (reports || []).filter((r) => r.status !== 'crashed' && Array.isArray(r.buttons) && r.buttons.some((b) => re.test(String(b).trim())));
+            if (!pages.length) return { found: false };
+            const target = pages[0];
+            const label = String(target.buttons.filter((b) => re.test(String(b).trim()))[0] || '').slice(0, 40);
+            const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+            const page = await context.newPage();
+            let payHost = null;
+            let popup = null;
+            context.on('page', (p) => { popup = p; });
+            await context.route('**/*', (route) => {
+              const u = route.request().url();
+              if (PAY_HOST_RE.test(u)) { payHost = u.slice(0, 120); return route.abort(); }
+              return route.continue();
+            });
+            const out = { found: true, label: label, from: target.route, reached: false, how: '', cameBack: true, payHost: null };
+            try {
+              await page.goto(BASE + target.route, { waitUntil: 'domcontentloaded', timeout: PER_ROUTE_MS });
+              await page.waitForTimeout(1500);
+              const before = page.url();
+              const beforeText = await page.evaluate(() => {
+                const root = document.getElementById('root') || document.body;
+                return root && root.innerText ? root.innerText.trim().length : 0;
+              });
+              await page.evaluate((src) => {
+                const rx = new RegExp(src, 'i');
+                const els = Array.from(document.querySelectorAll('button, [role="button"], a[href]'));
+                const el = els.find((e) => rx.test(((e.innerText || e.getAttribute('aria-label') || '')).trim()));
+                if (!el) return false;
+                el.click();
+                return true;
+              }, PAY_TEXT_SRC);
+              await page.waitForTimeout(2500);
+              const after = page.url();
+              const state = await page.evaluate(() => {
+                const root = document.getElementById('root') || document.body;
+                const t = root && root.innerText ? root.innerText : '';
+                return {
+                  text: t.trim().length,
+                  body: t.slice(0, 2500),
+                  form: !!document.querySelector('form, iframe[src*="stripe"], iframe[src*="paystack"], iframe[src*="flutterwave"], input[name*="card"]'),
+                  dialog: !!document.querySelector('[role="dialog"], [aria-modal="true"]'),
+                };
+              });
+              const contentMoved = Math.abs(state.text - beforeText) > 40;
+              const paymentWords = /card details|payment method|pay with|payment provider|enter your card/i.test(state.body);
+              out.reached = after !== before || !!popup || !!payHost || state.form || state.dialog || contentMoved || paymentWords;
+              out.how = after !== before ? ('moved to ' + after) : (payHost ? 'payment provider contacted' : (popup ? 'opened a payment window' : (state.form ? 'payment form appeared' : (state.dialog ? 'payment dialog appeared' : (paymentWords ? 'payment details shown' : (contentMoved ? 'the page changed' : 'nothing happened'))))));
+              out.payHost = payHost;
+              // Only a page that really left can fail to come back: goBack() with no
+              // prior history lands on a blank page and would blame a healthy app.
+              if (after !== before || popup || payHost) {
+                await page.goBack({ waitUntil: 'domcontentloaded', timeout: PER_ROUTE_MS }).catch(() => {});
+                await page.waitForTimeout(1200);
+                const back = await page.evaluate(() => {
+                  const root = document.getElementById('root') || document.body;
+                  return root && root.innerText ? root.innerText.trim().length : 0;
+                });
+                out.cameBack = back >= 8;
+                out.backText = back;
+              }
+            } catch (e) {
+              out.error = String((e && e.message) || e).slice(0, 200);
+            }
+            await context.close();
+            return out;
+          }
+
           (async () => {
             const routes = discoverRoutes();
             const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
@@ -438,12 +606,40 @@ jobs:
             }
             let deadLinks = [];
             try { deadLinks = await checkLinks(browser, reports); } catch (e) { deadLinks = []; }
+            let checkout = { found: false };
+            try { checkout = await probeCheckout(browser, reports); } catch (e) { checkout = { found: false, error: String((e && e.message) || e).slice(0, 160) }; }
             await browser.close();
+
+            // Money written more than one way, and screens that show a technical failure.
+            const merged = {};
+            for (const r of reports) {
+              const keys = moneyKeys(r.body || '');
+              for (const cur in keys) {
+                if (!merged[cur]) merged[cur] = {};
+                for (const shape in keys[cur]) if (!merged[cur][shape]) merged[cur][shape] = keys[cur][shape] + ' (' + r.route + ')';
+              }
+            }
+            const mixedMoney = Object.keys(merged).filter((c) => Object.keys(merged[c]).length > 1)
+              .map((c) => ({ currency: c, shapes: Object.keys(merged[c]).slice(0, 4), examples: Object.keys(merged[c]).slice(0, 4).map((s) => merged[c][s]) }));
+            const rawScreens = [];
+            for (const r of reports) {
+              if (r.status === 'crashed') continue;
+              const shown = rawErrorScreen(r.body || '');
+              if (shown) rawScreens.push({ route: r.route, shown: shown });
+            }
 
             const crashed = reports.filter((r) => r.status === 'crashed');
             const degraded = reports.filter((r) => r.status === 'degraded');
 
             const diagnostics = [];
+            const earlierHeads = [];
+            const headIssues = [];
+            for (const r of reports) {
+              if (!r.head || r.status === 'crashed' || r.finalPath !== r.route) continue;
+              for (const problem of headProblems(r.head, earlierHeads)) headIssues.push({route:r.route,problem});
+              earlierHeads.push(r.head);
+            }
+            for (const issue of headIssues) diagnostics.push({file:null,line:null,column:null,code:'PAGE_HEAD',message:issue.route + ': ' + issue.problem});
             for (const r of crashed) {
               for (const p of r.pageErrors.slice(0, 2)) {
                 diagnostics.push({
@@ -464,15 +660,40 @@ jobs:
                 message: 'Dead link on ' + d.from + ': "' + (d.text || d.href) + '" goes to ' + d.href + ' which shows "' + d.shown + '". Point this link at a record that exists (use the same id/slug the destination page looks up), or make the destination page find it. Do not change tests.',
               });
             }
+            for (const s of rawScreens) {
+              diagnostics.push({
+                file: null, line: null, column: null, code: 'ERROR_SCREEN_RAW',
+                message: s.route + ' shows a technical error to visitors: "' + s.shown + '". Replace it with a short friendly message and a way back; never print error objects, stack traces or raw server responses.',
+              });
+            }
+            if (checkout && checkout.found && !checkout.reached) {
+              diagnostics.push({
+                file: null, line: null, column: null, code: 'CHECKOUT_STUCK',
+                message: 'The "' + checkout.label + '" control on ' + checkout.from + ' does nothing: no payment page, form, window or provider was reached. Make it open the real payment step (your own checkout page or the provider), or remove the control.',
+              });
+            }
+            if (checkout && checkout.found && checkout.reached && checkout.cameBack === false) {
+              diagnostics.push({
+                file: null, line: null, column: null, code: 'CHECKOUT_NO_RETURN',
+                message: 'Coming back from the payment step leaves ' + checkout.from + ' blank (only ' + checkout.backText + ' characters render). The page must render again when the visitor returns.',
+              });
+            }
             for (const r of degraded.slice(0, 5)) {
               const first = r.consoleErrors[0] || (r.failedRequests[0] ? r.failedRequests[0].reason + ' ' + r.failedRequests[0].url : '');
               diagnostics.push({ file: null, line: null, column: null, code: 'RUNTIME_DEGRADED', message: r.route + ' — ' + String(first).slice(0, 300) });
             }
 
-            const failed = crashed.length > 0 || deadLinks.length > 0;
+            const checkoutStuck = !!(checkout && checkout.found && !checkout.reached);
+            const checkoutLost = !!(checkout && checkout.found && checkout.reached && checkout.cameBack === false);
+            const failed = crashed.length > 0 || deadLinks.length > 0 || rawScreens.length > 0 || checkoutStuck || checkoutLost || headIssues.length > 0;
             const out = {
               status: failed ? 'failed' : 'passed',
               deadLinks: deadLinks.slice(0, 10),
+              money: mixedMoney,
+              rawErrorScreens: rawScreens.slice(0, 8),
+              checkout: checkout,
+              headIssues: headIssues,
+              routesDiscovered: routes.length,
               routesChecked: reports.length,
               routesCrashed: crashed.length,
               routesDegraded: degraded.length,
@@ -489,7 +710,8 @@ jobs:
                   ? deadLinks.length + ' dead link(s): ' + deadLinks.slice(0, 4).map((d) => d.from + ' -> ' + d.href).join(', ')
                   : crashed.length > 0
                   ? crashed.length + ' of ' + reports.length + ' route(s) failed to boot: ' + crashed.map((r) => r.route).join(', ')
-                  : reports.length + ' route(s) booted clean' + (degraded.length ? ' (' + degraded.length + ' with console/network warnings)' : '') + '.',
+                  : reports.length + ' route(s) booted clean' + (degraded.length ? ' (' + degraded.length + ' with console/network warnings)' : '') + '.'
+                    + (mixedMoney.length ? ' Money is written more than one way: ' + mixedMoney.map((m) => m.currency + ' (' + m.examples.join(' vs ') + ')').join('; ') + '.' : ''),
             };
 
             fs.writeFileSync('/tmp/kross-runtime.json', JSON.stringify(out));
@@ -643,7 +865,23 @@ jobs:
           const { chromium } = require('playwright');
 
           const BASE = 'http://127.0.0.1:' + (process.env.KROSS_PREVIEW_PORT || '4173');
-          const MAX_ROUTES = 8;
+          const webRouteInventory = function webRouteInventory(files) {
+            const out = [];
+            for (const f of files){
+              const m = f.path.replaceAll('\\', '/').match(/^src\/routes\/(.+)\.[jt]sx?$/);
+              if (!m || /(^|[/.])(?:api|__root|-[^/.]*)($|[/.])/.test(m[1]) || m[1].includes('$')) continue;
+              const literal = /createFileRoute\(\s*['"]([^'"]+)['"]\s*\)/.exec(f.content)?.[1];
+              const parts = (literal || m[1]).replace(/\[([^\]]+)\]/g, '$1').split(/[/.]/).filter(Boolean).filter((p)=>!p.startsWith('_')).map((p)=>p.replace(/_$/, ''));
+              if (parts[parts.length - 1] === 'index') parts.pop();
+              if (/^\/_/.test(literal || '') && /<Outlet\s*\/?\s*>/.test(f.content)) continue;
+              if (!literal && /<Outlet\s*\/?\s*>/.test(f.content)) continue;
+              out.push({
+                path: f.path,
+                address: '/' + parts.join('/')
+              });
+            }
+            return out;
+          };
           // G34 — every route is audited at Mobile, Tablet AND Desktop. Breakpoint-only
           // defects (a nav that never collapses, a 3-up grid at 390px, contrast that
           // only fails in the mobile header) are invisible to a single-width audit.
@@ -700,7 +938,8 @@ jobs:
                 }
               }
             }
-            return Array.from(found).slice(0, MAX_ROUTES);
+            const canonical = webRouteInventory(files.map(f => ({path:f,content:fs.readFileSync(f,'utf8')})));
+            return canonical.length ? Array.from(new Set(canonical.map(r => r.address))) : Array.from(found);
           }
 
           const VITALS_SCRIPT = [
@@ -787,7 +1026,7 @@ jobs:
                 await page.addScriptTag({ path: axePath });
                 const result = await page.evaluate(async () => {
                   return await window.axe.run(document, {
-                    runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'] },
+                    runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'] },
                     resultTypes: ['violations'],
                   });
                 });
@@ -795,7 +1034,7 @@ jobs:
                   const nodes = (v.nodes || []).slice(0, 2).map((n) => String((n.target || []).join(' ')).slice(0, 120));
                   report.violations.push({
                     id: String(v.id || 'axe'),
-                    impact: String(v.impact || 'minor'),
+                    impact: v.id === 'target-size' ? 'critical' : String(v.impact || 'minor'),
                     help: String(v.help || '').slice(0, 200),
                     count: (v.nodes || []).length,
                     targets: nodes,
@@ -806,6 +1045,25 @@ jobs:
               }
             }
 
+            if (vp.isMobile) {
+              // Reduced viewport approximates keyboard obstruction; never claim real OS-keyboard proof.
+              await page.setViewportSize({width:vp.width,height:Math.max(280, Math.floor(vp.height * 0.55))});
+              const fields = page.locator('input:not([type="hidden"]),textarea').filter({visible:true});
+              const count = await fields.count();
+              for (let i=0; i<count; i++) {
+                const field = fields.nth(i);
+                await field.focus();
+                await field.scrollIntoViewIfNeeded();
+                const obscured = await field.evaluate(el => {
+                  const r = el.getBoundingClientRect();
+                  const x = Math.min(innerWidth-1,Math.max(0,r.x+r.width/2));
+                  const y = Math.min(innerHeight-1,Math.max(0,r.y+r.height/2));
+                  const hit = document.elementFromPoint(x,y);
+                  return r.top<0 || r.bottom>innerHeight || !(hit===el || el.contains(hit));
+                });
+                if (obscured) report.violations.push({id:'focused-input-obscured',impact:'critical',help:'Focused input is covered in reduced-height phone viewport',count:1,targets:[await field.getAttribute('name') || 'input']});
+              }
+            }
             await context.close();
             return report;
           }
@@ -1184,7 +1442,7 @@ jobs:
             if (check.expect) {
               const text = await visibleText(page);
               const sawExpect =
-                text.toLowerCase().includes(String(check.expect).toLowerCase()) || page.url() !== beforeUrl;
+                text.toLowerCase().includes(String(check.expect).toLowerCase());
               if (sawExpect) return { ok: true };
               return {
                 ok: false,
@@ -1531,6 +1789,10 @@ jobs:
             diagnostics.push(d);
           };
           const clean = (s) => String(s || '').replace(/\u001b\[[0-9;]*m/g, '').trim().slice(0, 400);
+          const infrastructureFault = function checkInfrastructureFault(text) {
+  return /\[kross:(?:runner|infrastructure)\]|ERR_CONNECTION_REFUSED|ECONNREFUSED|ERR_CONNECTION_RESET|ERR_EMPTY_RESPONSE|ERR_SOCKET_NOT_CONNECTED|\bENOSPC\b|no space left on device|\b(?:EAI_AGAIN|ENETUNREACH|ECONNABORTED)\b|(?:npm|registry|download)[^\n]{0,100}(?:ETIMEDOUT|ECONNRESET|HTTP 50[234]|socket hang up)|(?:sandbox exec|test machine|browser launch|install command)[^\n]{0,100}(?:timed out|timeout|out of memory)|browserType\.launch[^\n]{0,100}(?:Executable doesn't exist|Target closed)/i.test(String(text || ''));
+};
+          if (infrastructureFault(buildLog)) push({file:null,line:null,column:null,code:'CHECK_SETUP',message:'[kross:infrastructure] ' + clean(buildLog.slice(-2000))});
 
           // tsc:  src/App.tsx(12,3): error TS2322: Type 'x' is not assignable...
           for (const m of typeLog.matchAll(/^(.+?)\((\d+),(\d+)\):\s+error\s+(TS\d+):\s*(.+)$/gm)) {
@@ -1687,6 +1949,12 @@ jobs:
               routesCrashed: runtime.routesCrashed,
               routesDegraded: runtime.routesDegraded,
               reports: (runtime.reports || []).slice(0, 20),
+              routesDiscovered:runtime.routesDiscovered,
+              headIssues:runtime.headIssues || [],
+              deadLinks:runtime.deadLinks || [],
+              checkout:runtime.checkout,
+              money:runtime.money || [],
+              rawErrorScreens:runtime.rawErrorScreens || [],
               summary: runtime.summary,
             } : null,
             a11y: a11y ? {
