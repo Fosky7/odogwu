@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "tables": [
+    {
+      "schema": "public",
+      "table": "leaderboard_preferences",
+      "ownerColumn": "user_id",
+      "uniqueKey": ["user_id"],
+      "primaryKey": ["user_id"],
+      "disposable": true,
+      "fixtures": [
+        { "show_on_leaderboard": true },
+        { "show_on_leaderboard": false }
+      ],
+      "notes": "One row per account, keyed and owned by user_id (default auth.uid()). Fixtures must be written for the disposable E2E accounts only and removed afterwards (delete by user_id)."
+    },
+    {
+      "schema": "public",
+      "table": "user_pledges",
+      "ownerColumn": "owner_id",
+      "uniqueKey": ["id"],
+      "primaryKey": ["id"],
+      "disposable": true,
+      "fixtures": [
+        {
+          "reference": "ODG-VERIFY-FIXTURE-0001",
+          "cause_id": "1",
+          "cause_title": "Verification fixture pledge",
+          "amount_naira": 1000,
+          "created_at": "2024-04-16T09:20:00.000Z"
+        }
+      ],
+      "notes": "Owner-scoped pledge rows. amount_naira is a constrained positive numeric field, so every disposable fixture must supply an explicit valid value (whole naira, >= 1). Rows must be created through the UI/authenticated client for the disposable E2E accounts and deleted afterwards by id or reference."
+    }
+  ]
+}
