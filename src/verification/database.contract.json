@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "tables": [
+    {
+      "schema": "public",
+      "table": "leaderboard_preferences",
+      "primaryKey": ["user_id"],
+      "ownerColumn": "user_id",
+      "disposable": true,
+      "fixtures": [
+        { "show_on_leaderboard": true },
+        { "show_on_leaderboard": false }
+      ],
+      "notes": "One row per account. Fixtures must be written for the disposable E2E accounts only and removed afterwards (delete by user_id)."
+    }
+  ]
+}
