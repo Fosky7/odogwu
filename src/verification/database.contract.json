@@ -1,0 +1,33 @@
+{
+  "tables": [
+    {
+      "table": "payments",
+      "schema": "public",
+      "keyColumn": "id",
+      "keyType": "uuid",
+      "ownerColumn": "user_id",
+      "ownerType": "auth.users.id",
+      "uniqueColumns": ["pledge_reference", "paystack_reference"],
+      "moneyColumn": "amount_minor",
+      "moneyUnit": "kobo",
+      "statusColumn": "status",
+      "statusValues": ["pending", "initialized", "paid", "failed", "abandoned", "refunded"],
+      "fixtures": {
+        "pledge_reference": "e2e-disposable-{{runId}}-pledge",
+        "paystack_reference": "e2e-disposable-{{runId}}-paystack",
+        "cause_id": "1",
+        "amount_minor": 100000,
+        "currency": "NGN",
+        "status": "pending",
+        "donor_name": "E2E Disposable Donor",
+        "donor_email": "e2e-disposable@example.com"
+      },
+      "cleanup": {
+        "strategy": "delete-by-unique-column",
+        "column": "pledge_reference",
+        "matches": "e2e-disposable-*"
+      },
+      "notes": "Rows are disposable test data only. Never reuse a pre-existing pledge reference, never mutate another account's row, and never confirm a payment without a server-side verification result."
+    }
+  ]
+}
