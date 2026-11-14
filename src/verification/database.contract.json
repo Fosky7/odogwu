@@ -1,0 +1,40 @@
+{
+  "tables": [
+    {
+      "table": "user_pledges",
+      "owner": "owner_id",
+      "key": "reference"
+    },
+    {
+      "table": "leaderboard_preferences",
+      "owner": "user_id",
+      "key": "id"
+    },
+    {
+      "table": "bill_requests",
+      "owner": "owner_id",
+      "key": "source_id"
+    }
+  ],
+  "flowFixtures": [
+    {
+      "table": "user_pledges",
+      "owner": "owner_id",
+      "key": "reference",
+      "values": {
+        "reference": "E2E-RANK-FIXTURE-0001",
+        "cause_id": "1",
+        "cause_title": "Help Chinedu clear his hospital bill",
+        "amount_naira": 25000
+      }
+    },
+    {
+      "table": "leaderboard_preferences",
+      "owner": "user_id",
+      "key": "id",
+      "values": {
+        "show_on_leaderboard": false
+      }
+    }
+  ]
+}
