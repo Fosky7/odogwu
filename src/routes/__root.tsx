@@ -1,0 +1,575 @@
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Link, Outlet, createRootRoute, useRouterState } from "@tanstack/react-router";
+import { ArrowUpRight, Mail, Menu, ShieldCheck, X } from "lucide-react";
+
+import { AuthProvider, useAuth } from "@/context/AuthContext";
+
+const NAV_LINKS = [
+  { to: "/feed", label: "Bills" },
+  { to: "/create", label: "Request help" },
+  { to: "/dashboard", label: "Dashboard" },
+] as const;
+
+export const Route = createRootRoute({
+  component: RootLayout,
+  notFoundComponent: NotFoundPage,
+});
+
+/**
+ * Odogwu brand mark - a classic medallion rather than a filled app icon.
+ *
+ * A hairline outer ring frames a slightly heavier inner ring, and inside sits a
+ * line-drawn Igbo chieftaincy cap (okpu agu) crowned by a single upright eagle
+ * feather (ugo). Everything is stroked in `currentColor` so the emblem inherits
+ * the surrounding text colour in the header, the footer and on dark surfaces,
+ * and the thin, unfilled linework still reads at the 16px header size.
+ */
+function BrandLogo({ className = "h-8 w-8" }: { className?: string }) {
+  return (
+    <svg
+      role="img"
+      aria-label="Odogwu logo"
+      viewBox="0 0 40 40"
+      className={`${className} shrink-0 text-primary`}
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth={1.4}
+    >
+      {/* Classic double rule framing the mark. */}
+      <circle cx="20" cy="20" r="18.6" strokeWidth={0.9} opacity={0.5} />
+      <circle cx="20" cy="20" r="15.6" strokeWidth={1.2} />
+
+      {/* Eagle feather (ugo) rising out of the crown of the cap. */}
+      <path d="M20 6.9c1.8 1.9 2.7 3.9 2.7 5.9 0 1.2-.3 2.3-.8 3.4h-3.8c-.5-1.1-.8-2.2-.8-3.4 0-2 .9-4 2.7-5.9Z" />
+      <path d="M20 8.6v7.4" strokeWidth={0.9} opacity={0.7} />
+
+      {/* Okpu agu crown - a restrained dome that tapers into the band. */}
+      <path d="M12.7 20.9c0-2.9 3.3-5.2 7.3-5.2s7.3 2.3 7.3 5.2" />
+
+      {/* Wide cap band, parted from the crown by a hairline seam. */}
+      <rect x="11.7" y="20.9" width="16.6" height="5.1" rx="1.5" />
+      <path d="M13 23.4h14" strokeWidth={0.9} opacity={0.7} />
+    </svg>
+  );
+}
+
+/** Shared row styling for every entry inside the collapsed header menu. */
+const MENU_ITEM_CLASS =
+  "rounded-xl px-3 py-2.5 text-sm font-medium text-foreground transition-colors hover:bg-accent";
+
+/** Shared styling for every column link inside the footer. */
+const FOOTER_LINK_CLASS =
+  "inline-flex w-fit text-sm text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline";
+
+/**
+ * Editorial wordmark treatment shared by the header and the footer: a serif
+ * face with a whisper of extra tracking so the name reads as a masthead rather
+ * than a UI label. Layout and sizing are unchanged.
+ */
+const WORDMARK_CLASS =
+  "truncate font-serif font-semibold tracking-[0.02em]";
+
+/** Small uppercase heading used above each footer column. */
+function FooterHeading({ children }: { children: string }) {
+  return (
+    <h2 className="text-xs font-semibold uppercase tracking-[0.18em] text-foreground">
+      {children}
+    </h2>
+  );
+}
+
+/**
+ * `useLayoutEffect` runs before the browser paints, which is what we want for
+ * a scroll reset (it avoids a visible flash of the previous scroll offset).
+ * During server rendering there is no DOM, so fall back to `useEffect` to keep
+ * React from warning about a layout effect on the server.
+ */
+const useIsomorphicLayoutEffect =
+  typeof window !== "undefined" ? useLayoutEffect : useEffect;
+
+/**
+ * The root layout mounts the session provider once, above every route, so the
+ * shared header and the credential pages (login, signup, create) all read the
+ * same persisted session instead of degrading to the provider-less fallback.
+ */
+function RootLayout() {
+  return (
+    <AuthProvider>
+      <ShellLayout />
+    </AuthProvider>
+  );
+}
+
+/**
+ * Bring the viewport back to the very first pixel without any animation.
+ *
+ * The document itself is the scroll container for the whole app (the shell is a
+ * normal-flow column, never a nested scroller), so the reset targets the window
+ * and the document's scrolling element. `instant` is used explicitly so a
+ * `scroll-behavior: smooth` stylesheet rule cannot turn the reset into a
+ * visible upward glide. Any element that ever opts into owning its own scroll
+ * (`data-scroll-container`) is reset too, so a future nested scroller cannot
+ * silently keep the old offset.
+ */
+function scrollPageToTop(): void {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" as ScrollBehavior });
+  } catch {
+    window.scrollTo(0, 0);
+  }
+
+  // Belt and braces: some browsers ignore the options object above, and the
+  // document scrolling element can differ from `documentElement` (body in
+  // quirks mode), so both are sent back to their origin.
+  const scrollingElement = document.scrollingElement;
+  if (scrollingElement) scrollingElement.scrollTop = 0;
+  document.documentElement.scrollTop = 0;
+  if (document.body) document.body.scrollTop = 0;
+
+  document.querySelectorAll<HTMLElement>("[data-scroll-container]").forEach((node) => {
+    node.scrollTop = 0;
+    node.scrollLeft = 0;
+  });
+}
+
+function ShellLayout() {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const headerRef = useRef<HTMLElement | null>(null);
+  const prevSignedIn = useRef(false);
+  const { user, signOut } = useAuth();
+  const signedIn = Boolean(user);
+
+  // The current location, so the shell can react to every navigation (link tap,
+  // redirect or browser back/forward) no matter which link produced it. The
+  // pathname drives the scroll reset; the hash is honoured so /page#section
+  // links still land on their section instead of the top.
+  const locationPathname = useRouterState({ select: (state) => state.location.pathname });
+  const locationHash = useRouterState({ select: (state) => state.location.hash ?? "" });
+
+  // Close the menu on Escape or on a click/tap outside the header so the
+  // collapsed bar never traps the rest of the page.
+  useEffect(() => {
+    if (!menuOpen) return;
+
+    const close = () => setMenuOpen(false);
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (headerRef.current && !headerRef.current.contains(target)) close();
+    };
+
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("pointerdown", onPointerDown);
+
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [menuOpen]);
+
+  // The "Sign in" / "Create account" doorways live inside the menu, so the menu
+  // is reopened the moment a session ends (making them reachable straight away)
+  // and closed again as soon as somebody is signed in.
+  useEffect(() => {
+    if (signedIn) {
+      setMenuOpen(false);
+    } else if (prevSignedIn.current) {
+      setMenuOpen(true);
+    }
+    prevSignedIn.current = signedIn;
+  }, [signedIn]);
+
+  // Browsers restore the last scroll offset on back/forward by default, which
+  // fights the "every link opens at the top" rule. Take manual control once on
+  // mount so the reset below is always the only scroll source of truth.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if ("scrollRestoration" in window.history) {
+      window.history.scrollRestoration = "manual";
+    }
+  }, []);
+
+  // Every internal link opens its destination at the top of the page, so the
+  // offset is reset whenever the location changes. The reset runs before the
+  // first paint, then again over the next two frames (content that renders a
+  // tick later cannot leave the viewport part-way down), and once more after a
+  // short settle window so late data, images or fonts that grow the document
+  // during hydration still leave the reader at the top.
+  //
+  // The late settle pass is skipped as soon as the reader interacts with the
+  // page (wheel, touch, key or pointer), because at that point a scroll change
+  // is intentional - e.g. a pledge sheet opening over the feed must not yank
+  // the feed back to the top when it closes.
+  useIsomorphicLayoutEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const hash = locationHash.replace(/^#/, "");
+
+    const reset = () => {
+      if (hash) {
+        const target = document.getElementById(hash);
+        if (target) {
+          target.scrollIntoView({ block: "start" });
+          return;
+        }
+      }
+      scrollPageToTop();
+    };
+
+    let interacted = false;
+    const markInteracted = () => {
+      interacted = true;
+    };
+
+    // Passive listeners: this only observes intent, it never blocks scrolling.
+    window.addEventListener("wheel", markInteracted, { passive: true, once: true });
+    window.addEventListener("touchstart", markInteracted, { passive: true, once: true });
+    window.addEventListener("keydown", markInteracted, { once: true });
+    window.addEventListener("pointerdown", markInteracted, { passive: true, once: true });
+
+    // Immediate pass plus the next two frames must always win: the new page has
+    // not been seen yet, so landing at the top is the expected behaviour.
+    reset();
+
+    const firstFrame = window.requestAnimationFrame(reset);
+    const secondFrame = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (!interacted) reset();
+      });
+    });
+    const settleTimer = window.setTimeout(() => {
+      if (!interacted) reset();
+    }, 150);
+
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      window.cancelAnimationFrame(secondFrame);
+      window.clearTimeout(settleTimer);
+      window.removeEventListener("wheel", markInteracted);
+      window.removeEventListener("touchstart", markInteracted);
+      window.removeEventListener("keydown", markInteracted);
+      window.removeEventListener("pointerdown", markInteracted);
+    };
+  }, [locationPathname, locationHash]);
+
+  const handleSignOut = async () => {
+    try {
+      await signOut();
+    } catch {
+      /* keep the shell usable even if sign out fails */
+    }
+    setMenuOpen(true);
+  };
+
+  return (
+    // The shell is a normal-flow column inside the document: it never owns a
+    // scrollbar, so `window`/the document element stays the one and only scroll
+    // container. The sticky header below therefore sticks to the viewport while
+    // the page (content + footer) scrolls as one continuous document.
+    <div
+      data-testid="app-shell"
+      className="flex min-h-dvh flex-col bg-background text-foreground"
+    >
+      <header
+        ref={headerRef}
+        role="banner"
+        data-testid="site-header"
+        className="sticky top-0 z-40 border-b border-border/70 bg-background/85 backdrop-blur supports-[backdrop-filter]:bg-background/70"
+      >
+        {/* Top bar: the brand on the left and the menu button on the right. The
+            auth entry points (Sign in / Create account) live inside the menu,
+            never as separate tabs in the bar itself. */}
+        <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-1.5 px-4 py-3 sm:gap-3">
+          <Link
+            to="/"
+            className="flex min-w-0 items-center gap-2 text-foreground transition hover:opacity-90 sm:gap-2.5"
+            aria-label="Odogwu home"
+          >
+            {/* Phone keeps the original 16px logo / 28px name lockup; desktop
+                keeps the larger brand mark. */}
+            <BrandLogo className="h-4 w-4 shrink-0 sm:h-8 sm:w-8" />
+            <span className={`${WORDMARK_CLASS} text-lg leading-7 tracking-tight`}>
+              Odogwu
+            </span>
+          </Link>
+
+          <div className="flex items-center gap-1.5 sm:gap-3">
+            {signedIn ? (
+              <>
+                <Link
+                  to="/dashboard"
+                  className="rounded-xl px-2 py-2 text-sm font-semibold text-foreground transition-colors hover:bg-accent sm:px-3"
+                >
+                  Dashboard
+                </Link>
+                <button
+                  type="button"
+                  data-testid="header-signout"
+                  onClick={() => {
+                    void handleSignOut();
+                  }}
+                  className="rounded-xl border border-border bg-card px-2 py-2 text-sm font-semibold text-foreground shadow-sm transition-colors hover:bg-accent sm:px-3"
+                >
+                  Sign out
+                </button>
+              </>
+            ) : null}
+
+            <button
+              type="button"
+              data-testid="menu-toggle"
+              aria-label={menuOpen ? "Close menu" : "Open menu"}
+              aria-expanded={menuOpen}
+              aria-controls="site-menu"
+              onClick={() => setMenuOpen((open) => !open)}
+              className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-border bg-card text-foreground shadow-sm transition-colors hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            >
+              {menuOpen ? (
+                <X className="h-5 w-5" aria-hidden="true" />
+              ) : (
+                <Menu className="h-5 w-5" aria-hidden="true" />
+              )}
+            </button>
+          </div>
+        </div>
+
+        {/* Section tabs live inside the hamburger menu on every breakpoint. */}
+        {menuOpen && (
+          <nav
+            id="site-menu"
+            aria-label="Main"
+            className="border-t border-border bg-card/95 shadow-lg backdrop-blur"
+          >
+            <div className="mx-auto flex w-full max-w-6xl flex-col gap-1 px-3 py-3">
+              {NAV_LINKS.map((link) => (
+                <Link
+                  key={link.to}
+                  to={link.to}
+                  onClick={() => setMenuOpen(false)}
+                  className={MENU_ITEM_CLASS}
+                  activeProps={{
+                    className: `${MENU_ITEM_CLASS} bg-accent font-semibold text-primary`,
+                  }}
+                >
+                  {link.label}
+                </Link>
+              ))}
+
+              <div className="my-1 h-px bg-border" aria-hidden="true" />
+
+              {signedIn ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleSignOut();
+                  }}
+                  className={`${MENU_ITEM_CLASS} text-left`}
+                >
+                  Sign out
+                </button>
+              ) : (
+                <>
+                  <Link
+                    to="/login"
+                    onClick={() => setMenuOpen(false)}
+                    className={MENU_ITEM_CLASS}
+                  >
+                    Sign in
+                  </Link>
+                  <Link
+                    to="/signup"
+                    onClick={() => setMenuOpen(false)}
+                    className="mt-1 inline-flex items-center justify-center rounded-xl bg-primary px-3 py-2.5 text-sm font-semibold text-primary-foreground shadow-sm transition hover:opacity-95"
+                  >
+                    Create account
+                  </Link>
+                </>
+              )}
+            </div>
+          </nav>
+        )}
+      </header>
+
+      {/* The routed page is a plain block in normal document flow: the document
+          itself (not this wrapper) is the scroll container, so the header can
+          stay sticky and the footer scrolls as one continuous page. `min-w-0`
+          keeps wide tables/cards from forcing horizontal nesting. */}
+      <div className="min-w-0 flex-1" data-testid="page-content">
+        <Outlet />
+      </div>
+
+      <SiteFooter />
+    </div>
+  );
+}
+
+/**
+ * Full site footer. It is the single source of truth for the legal surface of
+ * the product: every policy that governs pledges, receipts and data handling is
+ * reachable from here in one tap, on phone and on desktop.
+ */
+function SiteFooter() {
+  const year = new Date().getFullYear();
+
+  return (
+    <footer
+      data-testid="site-footer"
+      className="border-t border-border bg-card text-foreground"
+    >
+      {/* Closing call to action - gives the footer a purpose, not just links. */}
+      <div className="border-b border-border bg-gradient-to-br from-primary/10 via-card to-card">
+        <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 py-12 sm:py-14 lg:flex-row lg:items-center lg:justify-between">
+          <div className="max-w-xl">
+            <p className="text-xs font-semibold uppercase tracking-[0.25em] text-primary">
+              Odogwu
+            </p>
+            <h2 className="mt-3 text-2xl font-bold tracking-tight sm:text-3xl">
+              Clear a bill. Prove every Naira.
+            </h2>
+            <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
+              Verified bills from real people, funded by donors who can see exactly
+              where their money lands - down to the receipt.
+            </p>
+          </div>
+
+          <div className="flex flex-col gap-3 sm:flex-row lg:shrink-0">
+            <Link
+              to="/feed"
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/20 transition hover:opacity-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+            >
+              Browse verified bills
+              <ArrowUpRight className="h-4 w-4" aria-hidden="true" />
+            </Link>
+            <Link
+              to="/create"
+              className="inline-flex items-center justify-center gap-2 rounded-xl border border-border bg-background px-5 py-3 text-sm font-semibold text-foreground transition hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+            >
+              Request help
+            </Link>
+          </div>
+        </div>
+      </div>
+
+      {/* Link columns */}
+      <div className="mx-auto grid w-full max-w-6xl gap-10 px-4 py-12 sm:grid-cols-2 lg:grid-cols-4">
+        {/* Brand + promise */}
+        <div className="sm:col-span-2 lg:col-span-1">
+          <Link to="/" className="flex items-center gap-2 hover:opacity-90">
+            <BrandLogo />
+            <span className={`${WORDMARK_CLASS} text-lg`}>Odogwu</span>
+          </Link>
+          <p className="mt-4 max-w-xs text-sm leading-relaxed text-muted-foreground">
+            A Nigerian bill-clearing platform where every bill is checked by a human
+            and every cleared naira produces a receipt the donor keeps.
+          </p>
+          <p className="mt-4 inline-flex items-center gap-2 rounded-full border border-border px-3 py-1 text-xs font-medium text-muted-foreground">
+            <ShieldCheck className="h-3.5 w-3.5 text-primary" aria-hidden="true" />
+            Every bill human-verified
+          </p>
+        </div>
+
+        {/* Platform. The auth doorways live in the header menu; the footer only
+            repeats the section links, so "Sign in" is declared exactly once on
+            the page and a role query for it resolves to a single element. */}
+        <nav aria-label="Platform" className="flex flex-col gap-3">
+          <FooterHeading>Platform</FooterHeading>
+          <Link to="/feed" className={FOOTER_LINK_CLASS}>
+            Bills feed
+          </Link>
+          <Link to="/dashboard" className={FOOTER_LINK_CLASS}>
+            My dashboard
+          </Link>
+          <Link to="/signup" className={FOOTER_LINK_CLASS}>
+            Create account
+          </Link>
+        </nav>
+
+        {/* Legal */}
+        <nav aria-label="Legal" className="flex flex-col gap-3">
+          <FooterHeading>Legal</FooterHeading>
+          <Link to="/legal/terms" className={FOOTER_LINK_CLASS}>
+            Terms of Service
+          </Link>
+          <Link to="/legal/privacy" className={FOOTER_LINK_CLASS}>
+            Privacy Policy
+          </Link>
+          <Link to="/legal/cookies" className={FOOTER_LINK_CLASS}>
+            Cookie Policy
+          </Link>
+          <Link to="/legal/donations" className={FOOTER_LINK_CLASS}>
+            Donation &amp; Refund Policy
+          </Link>
+          <Link to="/legal/accessibility" className={FOOTER_LINK_CLASS}>
+            Accessibility Statement
+          </Link>
+        </nav>
+
+        {/* Support */}
+        <div className="flex flex-col gap-3">
+          <FooterHeading>Support</FooterHeading>
+          <a
+            href="mailto:support@odogwu.ng"
+            className={`${FOOTER_LINK_CLASS} items-center gap-2`}
+          >
+            <Mail className="h-4 w-4" aria-hidden="true" />
+            support@odogwu.ng
+          </a>
+          <Link to="/legal/contact" className={FOOTER_LINK_CLASS}>
+            Contact &amp; complaints
+          </Link>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            We reply within two business days, Monday to Friday, 9:00-17:00 WAT.
+          </p>
+        </div>
+      </div>
+
+      {/* Bottom bar */}
+      <div className="border-t border-border">
+        <div className="mx-auto flex w-full max-w-6xl flex-col gap-3 px-4 py-6 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
+          <p>(c) {year} Odogwu. All rights reserved.</p>
+
+          {/* The last navigation in the document points back to the home page,
+              so a reader who has finished with the link columns is always one
+              tap from the starting page and browser history stays coherent
+              after following the media/legal links above. */}
+          <nav aria-label="Footer" className="flex flex-wrap items-center gap-4">
+            <Link to="/" className={FOOTER_LINK_CLASS}>
+              Home
+            </Link>
+          </nav>
+
+          <p>Built in Lagos - Every amount shown in Naira (N)</p>
+        </div>
+      </div>
+    </footer>
+  );
+}
+
+function NotFoundPage() {
+  return (
+    <main className="mx-auto w-full max-w-2xl px-4 py-16 text-center">
+      <h1 className="text-3xl font-bold tracking-tight text-foreground">
+        Page not found
+      </h1>
+      <p className="mt-3 text-sm text-muted-foreground">
+        The page you were looking for does not exist or has moved.
+      </p>
+      <Link
+        to="/"
+        className="mt-6 inline-flex items-center rounded-xl bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow-sm hover:opacity-95"
+      >
+        Back to the home page
+      </Link>
+    </main>
+  );
+}
