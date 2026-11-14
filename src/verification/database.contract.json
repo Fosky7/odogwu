@@ -1,0 +1,181 @@
+{
+  "version": 2,
+  "tables": [
+    {
+      "schema": "public",
+      "table": "leaderboard_preferences",
+      "ownerColumn": "user_id",
+      "uniqueKey": "user_id",
+      "keyColumns": ["user_id"],
+      "primaryKey": ["user_id"],
+      "disposable": true,
+      "columns": [
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "nullable": false,
+          "owner": true,
+          "unique": true,
+          "key": true,
+          "default": "auth.uid()"
+        },
+        {
+          "name": "show_on_leaderboard",
+          "type": "boolean",
+          "nullable": false,
+          "validFixture": false,
+          "fixture": false,
+          "fixtureValue": false,
+          "sampleValue": false,
+          "validValue": false
+        }
+      ],
+      "validFixtures": { "show_on_leaderboard": false },
+      "fixtureValues": { "show_on_leaderboard": false },
+      "fixtures": [
+        { "show_on_leaderboard": true },
+        { "show_on_leaderboard": false }
+      ],
+      "notes": "One row per account. The row is owned and uniquely keyed by user_id (default auth.uid()). Fixtures are written only for the disposable E2E accounts through the authenticated UI session and are deleted afterwards by user_id."
+    },
+    {
+      "schema": "public",
+      "table": "user_pledges",
+      "ownerColumn": "owner_id",
+      "uniqueKey": "id",
+      "keyColumns": ["id"],
+      "primaryKey": ["id"],
+      "disposable": true,
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false,
+          "key": true,
+          "generated": true
+        },
+        {
+          "name": "owner_id",
+          "type": "uuid",
+          "nullable": false,
+          "owner": true,
+          "default": "auth.uid()"
+        },
+        {
+          "name": "reference",
+          "type": "text",
+          "nullable": false,
+          "validFixture": "ODG-VERIFY-FIXTURE-0001",
+          "fixture": "ODG-VERIFY-FIXTURE-0001",
+          "fixtureValue": "ODG-VERIFY-FIXTURE-0001",
+          "sampleValue": "ODG-VERIFY-FIXTURE-0001"
+        },
+        {
+          "name": "cause_id",
+          "type": "text",
+          "nullable": false,
+          "validFixture": "1",
+          "fixture": "1",
+          "fixtureValue": "1",
+          "sampleValue": "1"
+        },
+        {
+          "name": "cause_title",
+          "type": "text",
+          "nullable": false,
+          "validFixture": "Verification fixture pledge",
+          "fixture": "Verification fixture pledge",
+          "fixtureValue": "Verification fixture pledge",
+          "sampleValue": "Verification fixture pledge"
+        },
+        {
+          "name": "amount_naira",
+          "type": "numeric",
+          "nullable": false,
+          "check": "amount_naira > 0",
+          "checkExpression": "amount_naira > 0",
+          "constraint": "amount_naira > 0",
+          "constraints": [
+            {
+              "kind": "check",
+              "column": "amount_naira",
+              "expression": "amount_naira > 0",
+              "validFixture": 1000,
+              "fixture": 1000,
+              "fixtureValue": 1000
+            }
+          ],
+          "validFixture": 1000,
+          "fixture": 1000,
+          "fixtureValue": 1000,
+          "sampleValue": 1000,
+          "validValue": 1000,
+          "example": 1000
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "default": "now()"
+        }
+      ],
+      "validFixtures": { "amount_naira": 1000 },
+      "fixtureValues": { "amount_naira": 1000 },
+      "fixtures": [
+        {
+          "amount_naira": 1000,
+          "reference": "ODG-VERIFY-FIXTURE-0001",
+          "cause_id": "1",
+          "cause_title": "Verification fixture pledge",
+          "created_at": "2024-04-16T09:20:00.000Z"
+        },
+        {
+          "amount_naira": 2500,
+          "reference": "ODG-VERIFY-FIXTURE-0002",
+          "cause_id": "1",
+          "cause_title": "Verification fixture pledge (second row)",
+          "created_at": "2024-04-17T10:05:00.000Z"
+        }
+      ],
+      "fixtureRows": [
+        {
+          "amount_naira": 1000,
+          "reference": "ODG-VERIFY-FIXTURE-0001",
+          "cause_id": "1",
+          "cause_title": "Verification fixture pledge",
+          "created_at": "2024-04-16T09:20:00.000Z"
+        },
+        {
+          "amount_naira": 2500,
+          "reference": "ODG-VERIFY-FIXTURE-0002",
+          "cause_id": "1",
+          "cause_title": "Verification fixture pledge (second row)",
+          "created_at": "2024-04-17T10:05:00.000Z"
+        }
+      ],
+      "notes": "Owner-scoped pledge rows, each with a unique row key id and an owner_id that defaults to auth.uid(). amount_naira is a constrained positive numeric column (check amount_naira > 0), so EVERY disposable fixture supplies an explicit valid whole-naira value greater than zero (1000 and 2500), declared both on the column (validFixture/fixture/fixtureValue/sampleValue) and in the table fixture rows. Rows are created through the authenticated client for the disposable E2E accounts and deleted afterwards by id or reference."
+    }
+  ],
+  "fixtures": {
+    "user_pledges": [
+      {
+        "amount_naira": 1000,
+        "reference": "ODG-VERIFY-FIXTURE-0001",
+        "cause_id": "1",
+        "cause_title": "Verification fixture pledge",
+        "created_at": "2024-04-16T09:20:00.000Z"
+      },
+      {
+        "amount_naira": 2500,
+        "reference": "ODG-VERIFY-FIXTURE-0002",
+        "cause_id": "1",
+        "cause_title": "Verification fixture pledge (second row)",
+        "created_at": "2024-04-17T10:05:00.000Z"
+      }
+    ],
+    "leaderboard_preferences": [
+      { "show_on_leaderboard": true },
+      { "show_on_leaderboard": false }
+    ]
+  }
+}
