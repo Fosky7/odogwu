@@ -1,5 +1,5 @@
 name: Kross Verify
-# KrossBuild bundle-verification lane v23-exact-findings
+# KrossBuild bundle-verification lane v24-money-small-amounts
 #
 # Proves that a candidate tree really installs, typechecks and bundles BEFORE
 # KrossBuild publishes it. Never deploys anything.
@@ -509,7 +509,7 @@ jobs:
                 : /[\u00a3]|GBP|pound/i.test(tok) ? 'GBP' : null;
               if (!cur) continue;
               const shape = cur + '|' + (/^[^\d]/.test(tok) ? 'before' : 'after') + '|' + (/NGN|USD|EUR|GBP/i.test(tok) ? 'code' : 'symbol')
-                + '|' + (/\.\d{1,2}/.test(tok) ? 'decimals' : 'whole') + '|' + (/\d,\d{3}/.test(tok) ? 'grouped' : 'flat');
+                + '|' + (/\.\d{1,2}/.test(tok) ? 'decimals' : 'whole') + '|' + (/\d,\d{3}/.test(tok) ? 'grouped' : /\d{4}/.test(tok) ? 'flat' : 'grouped');
               if (!keys[cur]) keys[cur] = {};
               if (!keys[cur][shape]) keys[cur][shape] = tok;
             }
