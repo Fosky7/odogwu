@@ -1,0 +1,13 @@
+node_modules/
+dist/
+build/
+coverage/
+.DS_Store
+*.local
+.env
+.env.local
+.env.production
+.vscode/
+.idea/
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
