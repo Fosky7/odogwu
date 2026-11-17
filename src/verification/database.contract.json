@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "tables": {
+    "public.payments": {
+      "schema": "public",
+      "table": "payments",
+      "ownerColumn": "user_id",
+      "primaryKey": "id",
+      "uniqueKeys": ["pledge_reference", "paystack_reference"],
+      "disposable": true,
+      "serverOnlyColumns": [
+        "status",
+        "amount_minor",
+        "currency",
+        "paid_at",
+        "verified_at",
+        "paystack_reference",
+        "receipt_reference",
+        "metadata"
+      ],
+      "fixtureFields": {
+        "pledge_reference": "e2e-disposable-{runId}",
+        "cause_id": "1",
+        "amount_minor": 10000,
+        "currency": "NGN",
+        "status": "pending",
+        "donor_name": "E2E Disposable Donor",
+        "donor_email": "e2e-disposable@example.com"
+      },
+      "policies": {
+        "select": "payments_select_own (user_id = auth.uid())",
+        "update": "payments_update_own (user_id = auth.uid(), server-only columns guarded)",
+        "writePath": "begin_pledge_payment / confirm_pledge_payment (security definer) + service role"
+      },
+      "cleanup": "delete disposable rows created for the run (pledge_reference like 'e2e-disposable-%')"
+    },
+    "public.giver_profiles": {
+      "schema": "public",
+      "table": "giver_profiles",
+      "ownerColumn": "user_id",
+      "primaryKey": "id",
+      "uniqueKeys": ["user_id"],
+      "disposable": true,
+      "fixtureFields": {
+        "display_name": "E2E Disposable Giver",
+        "is_anonymous": true
+      },
+      "policies": {
+        "select": "giver_profiles_select_own (user_id = auth.uid())",
+        "insert": "giver_profiles_insert_own (user_id = auth.uid())",
+        "update": "giver_profiles_update_own (user_id = auth.uid())",
+        "delete": "giver_profiles_delete_own (user_id = auth.uid())",
+        "writePath": "authenticated client upsert on user_id (owner-scoped by RLS)"
+      },
+      "cleanup": "delete the disposable owner row (user_id = auth.uid()) created for the run"
+    }
+  }
+}
