@@ -1,0 +1,44 @@
+{
+  "version": 2,
+  "tables": {
+    "payments": {
+      "schema": "public",
+      "owner": "user_id",
+      "key": "id",
+      "access": "private",
+      "fixture": {
+        "donor_name": "E2E Disposable Donor"
+      },
+      "writePath": "Server prepares one pending row; browser proves owner SELECT/UPDATE and foreign denial. Settlement remains server-only.",
+      "cleanup": "Server deletes only the generated payment UUID and disposable account."
+    },
+    "giver_profiles": {
+      "schema": "public",
+      "owner": "user_id",
+      "key": "user_id",
+      "access": "private",
+      "fixture": {
+        "display_name": "E2E Disposable Giver",
+        "is_anonymous": true
+      },
+      "writePath": "Disposable owner's account-keyed upsert; update is restored and account deletion cascades."
+    }
+  },
+  "flowFixtures": [
+    {
+      "table": "payments",
+      "owner": "user_id",
+      "key": "id",
+      "adapter": "pending-payment",
+      "values": {
+        "pledge_reference": "e2e-disposable-{runId}",
+        "cause_id": "1",
+        "amount_minor": 10000,
+        "currency": "NGN",
+        "status": "pending",
+        "donor_name": "E2E Disposable Donor",
+        "donor_email": "e2e-disposable@example.com"
+      }
+    }
+  ]
+}
