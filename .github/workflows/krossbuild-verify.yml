@@ -1,5 +1,5 @@
 name: Kross Verify
-# KrossBuild bundle-verification lane v21-valid-yaml-guard
+# KrossBuild bundle-verification lane v22-true-data-state
 #
 # Proves that a candidate tree really installs, typechecks and bundles BEFORE
 # KrossBuild publishes it. Never deploys anything.
@@ -201,6 +201,14 @@ jobs:
           cat > /tmp/kross-browser-tools/check.config.cjs <<'CONFIGEOF'
           module.exports={testDir:process.env.GITHUB_WORKSPACE+'/src/verification',testMatch:'**/*.spec.{ts,tsx,js,mjs,cjs}',timeout:45000,retries:0,workers:1,reporter:[['json',{outputFile:'/tmp/kross-browser-flows.json'}]],use:{baseURL:'http://127.0.0.1:4173',headless:true}};
           CONFIGEOF
+          cat > /tmp/kross-browser-tools/empty-state-hook.cjs <<'HOOKEOF'
+          const fs=require('fs'),path=require('path');const walk=d=>fs.readdirSync(d,{withFileTypes:true}).flatMap(e=>e.isDirectory()?walk(path.join(d,e.name)):[path.join(d,e.name)]);
+          const hook="\n;import { test as __krossEmptyT } from '@playwright/test';\n__krossEmptyT.afterEach(async ({ page }, info) => { if (info.status === info.expectedStatus) return; try { const ids = await page.evaluate(() => Array.from(document.querySelectorAll('[data-testid]')).filter((e) => /(^|-)(empty|no-results|none)$/i.test(e.getAttribute('data-testid') || '') && e.getClientRects().length > 0).map((e) => e.getAttribute('data-testid'))); if (ids.length) console.log('KROSS_EMPTY_STATE:' + ids.join(',')); } catch {} });\n";
+          for(const f of walk('src/verification').filter(p=>/\.spec\.[cm]?[jt]sx?$/.test(p))){const c=fs.readFileSync(f,'utf8');if(c.includes('@playwright/test')&&!c.includes('__krossEmptyT'))fs.writeFileSync(f,c+hook);}
+          HOOKEOF
+          # Record the page's real empty state on failure so a test that assumed rows the
+          # live database does not hold is told apart from a broken page.
+          node /tmp/kross-browser-tools/empty-state-hook.cjs || true
           /tmp/kross-browser-tools/node_modules/.bin/playwright test --config=/tmp/kross-browser-tools/check.config.cjs --pass-with-no-tests
 
       - name: 🧪 Boot assertion (every route, real browser)
@@ -1846,7 +1854,8 @@ jobs:
                 const r = (t.results || []).find((x) => x.status !== 'passed') || {};
                 const lines = String((r.error && (r.error.message || r.error.value)) || (r.errors && r.errors[0] && r.errors[0].message) || 'failed').replace(/\u001b\[[0-9;]*m/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
                 const err = clean([lines[0], ...lines.filter((l) => /^(Expected|Received|Locator|- waiting for|- locator resolved|unexpected value)/i.test(l)).slice(0, 4)].join(' · '));
-                push({ file: 'src/verification/' + String(spec.file || suite.file || '').replace(/^.*src\/verification\//, ''), line: spec.line || null, column: null, code: 'FLOW', message: clean((title ? title + ' › ' : '') + spec.title + ' — ' + err) });
+                const empties = (r.stdout || []).map((x) => String((x && x.text) || '')).map((x) => (x.match(/KROSS_EMPTY_STATE:([\w,-]+)/) || [])[1]).filter(Boolean);
+                push({ file: 'src/verification/' + String(spec.file || suite.file || '').replace(/^.*src\/verification\//, ''), line: spec.line || null, column: null, code: 'FLOW', message: clean((title ? title + ' › ' : '') + spec.title + ' — ' + err + (empties.length ? ' · KROSS_EMPTY_STATE: ' + empties[0] : '')) });
               }
               for (const child of suite.suites || []) walk(child, title);
             };
