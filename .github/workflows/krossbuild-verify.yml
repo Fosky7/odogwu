@@ -1,5 +1,5 @@
 name: Kross Verify
-# KrossBuild bundle-verification lane v22-true-data-state
+# KrossBuild bundle-verification lane v23-exact-findings
 #
 # Proves that a candidate tree really installs, typechecks and bundles BEFORE
 # KrossBuild publishes it. Never deploys anything.
@@ -686,7 +686,7 @@ jobs:
                 message: 'Coming back from the payment step leaves ' + checkout.from + ' blank (only ' + checkout.backText + ' characters render). The page must render again when the visitor returns.',
               });
             }
-            for (const r of degraded.slice(0, 5)) {
+            for (const r of degraded) {
               const first = r.consoleErrors[0] || (r.failedRequests[0] ? r.failedRequests[0].reason + ' ' + r.failedRequests[0].url : '');
               diagnostics.push({ file: null, line: null, column: null, code: 'RUNTIME_DEGRADED', message: r.route + ' — ' + String(first).slice(0, 300) });
             }
@@ -712,7 +712,7 @@ jobs:
                 failedRequests: r.failedRequests.slice(0, 3),
                 pageErrors: r.pageErrors.slice(0, 2),
               })),
-              diagnostics: diagnostics.slice(0, 30),
+              diagnostics,
               summary:
                 deadLinks.length > 0 && crashed.length === 0
                   ? deadLinks.length + ' dead link(s): ' + deadLinks.slice(0, 4).map((d) => d.from + ' -> ' + d.href).join(', ')
@@ -1142,7 +1142,7 @@ jobs:
                 perfNotes.push({ code: 'PERF_WEIGHT', message: vpTag + r.route + ' — page transfers ' + Math.round(p.bytes / 1024) + 'KB; split the bundle or lazy-load below-the-fold work.' });
               }
             }
-            for (const n of perfNotes.slice(0, 14)) {
+            for (const n of perfNotes) {
               diagnostics.push({ file: null, line: null, column: null, code: n.code, message: n.message });
             }
 
@@ -1166,7 +1166,7 @@ jobs:
                 perf: r.perf,
                 violations: (r.violations || []).slice(0, 6),
               })),
-              diagnostics: diagnostics.slice(0, 30),
+              diagnostics,
               summary:
                 critical > 0
                   ? critical + ' critical accessibility issue(s) across ' + uniqueRoutes + ' page(s) x ' + VIEWPORTS.length + ' viewport(s).'
@@ -1792,7 +1792,6 @@ jobs:
           const typeLog = read('typecheck.log');
           const diagnostics = [];
           const push = (d) => {
-            if (diagnostics.length >= 40) return;
             if (diagnostics.some((x) => x.file === d.file && x.line === d.line && x.message === d.message)) return;
             diagnostics.push(d);
           };
