@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "goal": "Finish the /create accessibility repair in src/routes/create.tsx. Fix the TS2739 refusal caused by returning Promise<AuthUserSummary> as AccountUser, and fix the two bg-emerald-600 contrast findings. Keep the saved AppShell and CSS focus work unchanged.",
+  "planVersion": 1,
+  "checks": [
+    {
+      "id": "s1-c0",
+      "step": 1,
+      "route": "/create",
+      "criterion": "navigating to /create opens the page",
+      "kind": "route",
+      "target": "/create"
+    }
+  ]
+}
